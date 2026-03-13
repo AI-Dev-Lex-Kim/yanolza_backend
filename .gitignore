@@ -1,0 +1,8 @@
+__pycache__/
+*.py[oc]
+.venv/
+.env
+
+# runtime artifacts
+data/monitor_history.jsonl
+data/monitor_history_state.json
