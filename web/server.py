@@ -43,6 +43,7 @@ SESSION_TIMEOUT_SECONDS = 45.0
 SHUTDOWN_GRACE_SECONDS = 3.0
 MONITOR_LOG_FILE_NAME = "monitor_history.jsonl"
 MONITOR_STATE_FILE_NAME = "monitor_history_state.json"
+MONITOR_KEEP_LIMIT = 10
 DEFAULT_LOG_LIMIT = 60
 MAX_LOG_LIMIT = 500
 
@@ -382,11 +383,33 @@ class MonitorLogStore:
 
     def append_check(self, event: dict[str, Any]) -> None:
         with self._lock:
-            line = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
-            with self.log_path.open("a", encoding="utf-8") as handle:
-                handle.write(line)
-                handle.write("\n")
-            self._update_state_inplace(self._state, event)
+            events: list[dict[str, Any]] = []
+            if self.log_path.exists():
+                try:
+                    lines = self.log_path.read_text(encoding="utf-8").splitlines()
+                except OSError:
+                    lines = []
+                for line in lines:
+                    text = line.strip()
+                    if not text:
+                        continue
+                    try:
+                        payload = json.loads(text)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(payload, dict):
+                        events.append(payload)
+            events.append(event)
+            if len(events) > MONITOR_KEEP_LIMIT:
+                events = events[-MONITOR_KEEP_LIMIT:]
+            with self.log_path.open("w", encoding="utf-8") as handle:
+                for payload in events:
+                    line = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+                    handle.write(line)
+                    handle.write("\n")
+            self._state = self._empty_state()
+            for payload in events:
+                self._update_state_inplace(self._state, payload)
             self._persist_state(self._state)
 
     def recent(self, limit: int = DEFAULT_LOG_LIMIT) -> list[dict[str, Any]]:
