@@ -8,6 +8,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from web import server
@@ -43,6 +44,71 @@ class QueueCheck:
             "matches": [],
             "url": url,
         }
+
+
+class TimedCheck:
+    def __init__(self) -> None:
+        self.items: list[tuple[float, dict[str, object]]] = []
+        self.start_at: float | None = None
+
+    def push_result(self, at: float, result: dict[str, object]) -> None:
+        self.items.append((at, result))
+        self.items.sort(key=lambda item: item[0])
+
+    def __call__(
+        self,
+        url: str,
+        room_name: str | None,
+        stay_type: str | None,
+        check_in: str | None,
+        check_out: str | None,
+        scan_all: bool,
+    ) -> dict[str, object]:
+        if self.start_at is None:
+            self.start_at = time.monotonic()
+        elapsed = time.monotonic() - self.start_at
+        current = None
+        for at, result in self.items:
+            if elapsed >= at:
+                current = result
+            else:
+                break
+        if current is not None:
+            return current
+        return {
+            "available": False,
+            "status": "closed",
+            "matches": [],
+            "url": url,
+        }
+
+
+def wait_for_count(items: list[object], count: int, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if len(items) >= count:
+            return True
+        time.sleep(0.05)
+    return len(items) >= count
+
+
+class NtfyHandler(BaseHTTPRequestHandler):
+    def do_POST(self) -> None:
+        length = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(length).decode("utf-8")
+        self.server.calls.append(
+            {
+                "path": self.path,
+                "body": body,
+                "priority": self.headers.get("Priority"),
+            }
+        )
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"ok")
+
+    def log_message(self, format: str, *args: object) -> None:
+        return
 
 
 def make_payload(**overrides: object) -> dict[str, object]:
@@ -172,6 +238,22 @@ class MonitorManagerTests(unittest.TestCase):
         self.assertEqual(1, len(self.notify_calls))
         self.assertIn("예약가능", self.notify_calls[0][1])
 
+    def test_single_monitor_notifies_when_initial_check_is_available(self) -> None:
+        self.check.push_result(
+            {
+                "available": True,
+                "status": "available",
+                "matches": [{"h2_text": "Deluxe", "has_book": True}],
+                "url": "https://example.com/room",
+            }
+        )
+
+        self.manager.upsert(make_spec())
+        self.assertEqual(1, self.manager.run_all_due())
+
+        self.assertEqual(1, len(self.notify_calls))
+        self.assertIn("예약가능", self.notify_calls[0][1])
+
     def test_scan_all_notifies_on_available_room_changes(self) -> None:
         self.check.push_result(
             {
@@ -218,10 +300,11 @@ class MonitorManagerTests(unittest.TestCase):
         force_due(self.manager, monitor["monitor_id"])
         self.manager.run_all_due()
 
-        self.assertEqual(2, len(self.notify_calls))
-        self.assertIn("가용 객실 변경", self.notify_calls[0][1])
-        self.assertIn("B", self.notify_calls[0][1])
-        self.assertIn("없음", self.notify_calls[1][1])
+        self.assertEqual(3, len(self.notify_calls))
+        self.assertIn("예약가능", self.notify_calls[0][1])
+        self.assertIn("예약 가능 객실 변경", self.notify_calls[1][1])
+        self.assertIn("B", self.notify_calls[1][1])
+        self.assertIn("없음", self.notify_calls[2][1])
 
     def test_failed_check_updates_error_and_keeps_monitor(self) -> None:
         self.check.push_error(RuntimeError("boom"))
@@ -242,6 +325,160 @@ class MonitorManagerTests(unittest.TestCase):
 
         self.manager.stop_monitor(monitor["monitor_id"], user_id="user-a")
         self.assertFalse(server.should_hold_shutdown(self.manager))
+
+
+class MonitorLogStoreTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.logs = server.MonitorLogStore(Path(self.tmpdir.name))
+
+    def tearDown(self) -> None:
+        self.tmpdir.cleanup()
+
+    def test_log_store_keeps_up_to_180_entries(self) -> None:
+        for idx in range(server.MONITOR_KEEP_LIMIT + 5):
+            self.logs.append_check(
+                {
+                    "timestamp": f"2026-03-21T00:00:{idx:02d}+00:00",
+                    "ok": True,
+                    "status": "available",
+                    "url": f"https://example.com/{idx}",
+                }
+            )
+
+        events = self.logs.recent(limit=server.MAX_LOG_LIMIT)
+
+        self.assertEqual(180, len(events))
+        self.assertEqual("https://example.com/184", events[0]["url"])
+        self.assertEqual("https://example.com/5", events[-1]["url"])
+
+
+class RealtimeMonitorTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.logs = server.MonitorLogStore(Path(self.tmpdir.name))
+        self.ntfy = ThreadingHTTPServer(("127.0.0.1", 0), NtfyHandler)
+        self.ntfy.calls = []
+        self.ntfy_thread = threading.Thread(target=self.ntfy.serve_forever, daemon=True)
+        self.ntfy_thread.start()
+        self.prev_base_url = server.NTFY_BASE_URL
+        server.NTFY_BASE_URL = f"http://127.0.0.1:{self.ntfy.server_address[1]}"
+
+    def tearDown(self) -> None:
+        server.NTFY_BASE_URL = self.prev_base_url
+        self.ntfy.shutdown()
+        self.ntfy_thread.join(timeout=2.0)
+        self.ntfy.server_close()
+        self.tmpdir.cleanup()
+
+    def test_realtime_scan_all_sends_ntfy_for_first_and_later_dayuse_rooms(self) -> None:
+        check = TimedCheck()
+        check.push_result(
+            0.0,
+            {
+                "available": False,
+                "status": "closed",
+                "matches": [],
+                "url": "https://example.com/room",
+            },
+        )
+        check.push_result(
+            0.4,
+            {
+                "available": True,
+                "status": "available",
+                "matches": [{"h2_text": "A", "has_book": True}],
+                "url": "https://example.com/room",
+            },
+        )
+        check.push_result(
+            1.4,
+            {
+                "available": True,
+                "status": "available",
+                "matches": [
+                    {"h2_text": "A", "has_book": True},
+                    {"h2_text": "B", "has_book": True},
+                ],
+                "url": "https://example.com/room",
+            },
+        )
+        manager = server.MonitorManager(
+            monitor_logs=self.logs,
+            check_fn=check,
+            notify_fn=server.send_ntfy_message,
+            topic_getter=lambda: "topic",
+        )
+        manager.start()
+        self.addCleanup(manager.stop)
+
+        manager.upsert(
+            make_spec(
+                name="realtime-dayuse-scan",
+                scan_all=True,
+                room_name=None,
+                stay_type="대실",
+                interval_seconds=1,
+            )
+        )
+
+        self.assertTrue(wait_for_count(self.ntfy.calls, 2, timeout=3.5))
+        time.sleep(0.3)
+
+        self.assertEqual(2, len(self.ntfy.calls))
+        self.assertEqual("/topic", self.ntfy.calls[0]["path"])
+        self.assertEqual("high", self.ntfy.calls[0]["priority"])
+        self.assertIn("예약가능 [대실] realtime-dayuse-scan", self.ntfy.calls[0]["body"])
+        self.assertEqual("/topic", self.ntfy.calls[1]["path"])
+        self.assertEqual("high", self.ntfy.calls[1]["priority"])
+        self.assertIn("예약 가능 객실 변경 [대실] realtime-dayuse-scan", self.ntfy.calls[1]["body"])
+        self.assertIn("A, B", self.ntfy.calls[1]["body"])
+
+    def test_realtime_single_room_sends_ntfy_when_dayuse_appears_later(self) -> None:
+        check = TimedCheck()
+        check.push_result(
+            0.0,
+            {
+                "available": False,
+                "status": "closed",
+                "matches": [],
+                "url": "https://example.com/room",
+            },
+        )
+        check.push_result(
+            0.4,
+            {
+                "available": True,
+                "status": "available",
+                "matches": [{"h2_text": "Deluxe", "has_book": True}],
+                "url": "https://example.com/room",
+            },
+        )
+        manager = server.MonitorManager(
+            monitor_logs=self.logs,
+            check_fn=check,
+            notify_fn=server.send_ntfy_message,
+            topic_getter=lambda: "topic",
+        )
+        manager.start()
+        self.addCleanup(manager.stop)
+
+        manager.upsert(
+            make_spec(
+                name="realtime-dayuse-room",
+                room_name="Deluxe",
+                stay_type="대실",
+                interval_seconds=1,
+            )
+        )
+
+        self.assertTrue(wait_for_count(self.ntfy.calls, 1, timeout=2.5))
+        time.sleep(0.3)
+
+        self.assertEqual(1, len(self.ntfy.calls))
+        self.assertEqual("/topic", self.ntfy.calls[0]["path"])
+        self.assertEqual("high", self.ntfy.calls[0]["priority"])
+        self.assertIn("예약가능 [대실] realtime-dayuse-room", self.ntfy.calls[0]["body"])
 
 
 class ApiTests(unittest.TestCase):
