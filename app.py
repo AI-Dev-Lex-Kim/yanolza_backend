@@ -443,31 +443,29 @@ def load_env(path: Path) -> None:
 
 
 def send_ntfy_message(topic: str, text: str) -> dict[str, Any]:
-    try:
-        import requests
-    except ModuleNotFoundError:
-        return {"ok": False, "error": "requests package is not installed"}
     safe_text = (text or "").strip()
     if not topic:
         return {"ok": False, "error": "NTFY topic missing"}
     if not safe_text:
         return {"ok": False, "error": "message missing"}
+    request = urllib.request.Request(
+        f"{NTFY_BASE_URL}/{topic}",
+        headers={"Priority": "high"},
+        data=safe_text.encode("utf-8"),
+        method="POST",
+    )
     try:
-        response = requests.post(
-            f"{NTFY_BASE_URL}/{topic}",
-            headers={"Priority": "high"},
-            data=safe_text,
-            timeout=10,
-        )
-        response.raise_for_status()
-    except requests.RequestException as err:
-        error_text = ""
-        if err.response is not None:
-            error_text = (err.response.text or "").strip()
+        with urllib.request.urlopen(request, timeout=10) as response:
+            body = response.read().decode("utf-8", errors="ignore").strip()
+    except urllib.error.HTTPError as err:
+        error_text = err.read().decode("utf-8", errors="ignore").strip()
         if not error_text:
             error_text = str(err)
         return {"ok": False, "error": error_text}
-    return {"ok": True, "response": (response.text or "").strip()}
+    except urllib.error.URLError as err:
+        error_text = str(err)
+        return {"ok": False, "error": error_text}
+    return {"ok": True, "response": body}
 
 
 def load_watchlist(path: Path) -> list[WatchItem]:
