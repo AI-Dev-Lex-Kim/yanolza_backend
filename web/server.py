@@ -12,11 +12,12 @@ import threading
 import time
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
-from datetime import datetime, timezone
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 def _get_runtime_root() -> Path:
@@ -46,6 +47,21 @@ MONITOR_STATE_FILE_NAME = "monitor_history_state.json"
 MONITOR_KEEP_LIMIT = 10
 DEFAULT_LOG_LIMIT = 60
 MAX_LOG_LIMIT = 500
+MONITOR_IDLE_WAIT_SECONDS = 1.0
+MONITOR_START_FIELDS = {
+    "user_id",
+    "name",
+    "url",
+    "room_name",
+    "scan_all",
+    "stay_type",
+    "check_in",
+    "check_out",
+    "interval_seconds",
+    "start_notify",
+    "ntfy_enabled",
+}
+MONITOR_STOP_FIELDS = {"monitor_id", "user_id"}
 
 
 def normalize_client_type(value: str | None) -> str:
@@ -224,6 +240,610 @@ class SessionTracker:
                 self._no_sessions_since = now
                 return False
             return (now - self._no_sessions_since) >= self.shutdown_grace
+
+
+@dataclass(frozen=True)
+class MonitorSpec:
+    user_id: str
+    name: str
+    url: str
+    room_name: str | None
+    scan_all: bool
+    stay_type: str | None
+    check_in: str | None
+    check_out: str | None
+    interval_seconds: int
+    start_notify: bool
+    target_key: str
+
+
+@dataclass
+class MonitorState:
+    last_status: str | None = None
+    last_checked_at: str | None = None
+    last_error: str | None = None
+    next_run_at: str | None = None
+    last_available_rooms: list[str] = field(default_factory=list)
+    last_result: dict[str, Any] | None = None
+
+
+@dataclass
+class MonitorRecord:
+    monitor_id: str
+    spec: MonitorSpec
+    state: MonitorState
+    created_at: str
+    updated_at: str
+    running: bool = False
+    start_notify_pending: bool = False
+    next_run_mono: float = 0.0
+
+    def to_public(self) -> dict[str, Any]:
+        rooms = None
+        if self.spec.scan_all:
+            rooms = list(self.state.last_available_rooms)
+        return {
+            "monitor_id": self.monitor_id,
+            "user_id": self.spec.user_id,
+            "name": self.spec.name,
+            "url": self.spec.url,
+            "room_name": self.spec.room_name,
+            "scan_all": self.spec.scan_all,
+            "stay_type": self.spec.stay_type,
+            "check_in": self.spec.check_in,
+            "check_out": self.spec.check_out,
+            "interval_seconds": self.spec.interval_seconds,
+            "start_notify": self.spec.start_notify,
+            "last_checked_at": self.state.last_checked_at,
+            "last_status": self.state.last_status,
+            "last_error": self.state.last_error,
+            "next_run_at": self.state.next_run_at,
+            "last_available_rooms": rooms,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        }
+
+
+@dataclass(frozen=True)
+class MonitorJob:
+    monitor_id: str
+    spec: MonitorSpec
+    start_notify: bool
+
+
+def normalize_monitor_text(value: Any, field_name: str) -> tuple[str | None, str | None]:
+    if value is None:
+        return None, None
+    if not isinstance(value, str):
+        return None, f"Invalid {field_name}"
+    text = value.strip()
+    if not text:
+        return None, None
+    return text, None
+
+
+def build_monitor_key(
+    user_id: str,
+    url: str,
+    room_name: str | None,
+    scan_all: bool,
+    stay_type: str | None,
+    check_in: str | None,
+    check_out: str | None,
+) -> str:
+    return json.dumps(
+        {
+            "user_id": user_id,
+            "url": url,
+            "room_name": room_name,
+            "scan_all": scan_all,
+            "stay_type": stay_type,
+            "check_in": check_in,
+            "check_out": check_out,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def parse_monitor_start(payload: dict[str, Any], ntfy_topic: str | None) -> tuple[MonitorSpec | None, str | None]:
+    if not isinstance(payload, dict):
+        return None, "Invalid payload"
+    missing = []
+    for key in MONITOR_START_FIELDS:
+        if key not in payload:
+            missing.append(key)
+    if missing:
+        missing.sort()
+        return None, f"Missing fields: {', '.join(missing)}"
+    extra = []
+    for key in payload:
+        if key not in MONITOR_START_FIELDS:
+            extra.append(key)
+    if extra:
+        extra.sort()
+        return None, f"Unexpected fields: {', '.join(extra)}"
+
+    name, error = normalize_monitor_text(payload.get("name"), "name")
+    if error:
+        return None, error
+    if not name:
+        return None, "Missing name"
+    user_id, error = normalize_monitor_text(payload.get("user_id"), "user_id")
+    if error:
+        return None, error
+    if not user_id:
+        return None, "Missing user_id"
+
+    url, error = normalize_monitor_text(payload.get("url"), "url")
+    if error:
+        return None, error
+    if not url:
+        return None, "Missing url"
+
+    room_name, error = normalize_monitor_text(payload.get("room_name"), "room_name")
+    if error:
+        return None, error
+    stay_type, error = normalize_monitor_text(payload.get("stay_type"), "stay_type")
+    if error:
+        return None, error
+    check_in, error = normalize_monitor_text(payload.get("check_in"), "check_in")
+    if error:
+        return None, error
+    check_out, error = normalize_monitor_text(payload.get("check_out"), "check_out")
+    if error:
+        return None, error
+
+    scan_all = payload.get("scan_all")
+    if not isinstance(scan_all, bool):
+        return None, "Invalid scan_all"
+    start_notify = payload.get("start_notify")
+    if not isinstance(start_notify, bool):
+        return None, "Invalid start_notify"
+    ntfy_enabled = payload.get("ntfy_enabled")
+    if not isinstance(ntfy_enabled, bool):
+        return None, "Invalid ntfy_enabled"
+    if not ntfy_enabled:
+        return None, "ntfy_enabled must be true"
+    if not (ntfy_topic or "").strip():
+        return None, "Missing NTFY_TOPIC"
+
+    interval_seconds = payload.get("interval_seconds")
+    if isinstance(interval_seconds, bool) or not isinstance(interval_seconds, int):
+        return None, "Invalid interval_seconds"
+    if interval_seconds <= 0:
+        return None, "interval_seconds must be positive"
+
+    if scan_all:
+        room_name = None
+    if not scan_all and not room_name:
+        return None, "Missing room_name"
+
+    target_key = build_monitor_key(user_id, url, room_name, scan_all, stay_type, check_in, check_out)
+    return (
+        MonitorSpec(
+            user_id=user_id,
+            name=name,
+            url=url,
+            room_name=room_name,
+            scan_all=scan_all,
+            stay_type=stay_type,
+            check_in=check_in,
+            check_out=check_out,
+            interval_seconds=interval_seconds,
+            start_notify=start_notify,
+            target_key=target_key,
+        ),
+        None,
+    )
+
+
+def parse_monitor_stop(payload: dict[str, Any]) -> tuple[tuple[str, str] | None, str | None]:
+    if not isinstance(payload, dict):
+        return None, "Invalid payload"
+    missing = []
+    for key in MONITOR_STOP_FIELDS:
+        if key not in payload:
+            missing.append(key)
+    if missing:
+        return None, "Missing monitor_id"
+    extra = []
+    for key in payload:
+        if key not in MONITOR_STOP_FIELDS:
+            extra.append(key)
+    if extra:
+        extra.sort()
+        return None, f"Unexpected fields: {', '.join(extra)}"
+    monitor_id, error = normalize_monitor_text(payload.get("monitor_id"), "monitor_id")
+    if error:
+        return None, error
+    if not monitor_id:
+        return None, "Missing monitor_id"
+    user_id, error = normalize_monitor_text(payload.get("user_id"), "user_id")
+    if error:
+        return None, error
+    if not user_id:
+        return None, "Missing user_id"
+    return (monitor_id, user_id), None
+
+
+def extract_available_rooms(result: dict[str, Any]) -> list[str]:
+    matches = result.get("matches")
+    if not isinstance(matches, list):
+        return []
+    rooms: list[str] = []
+    seen: set[str] = set()
+    for match in matches:
+        if not isinstance(match, dict):
+            continue
+        if not bool(match.get("has_book")):
+            continue
+        room_name = str(match.get("h2_text") or "").strip()
+        if not room_name or room_name in seen:
+            continue
+        seen.add(room_name)
+        rooms.append(room_name)
+    rooms.sort()
+    return rooms
+
+
+def build_monitor_message(
+    spec: MonitorSpec,
+    status: str,
+    available_rooms: list[str],
+    error_text: str | None,
+    reason: str,
+) -> str:
+    stay_label = str(spec.stay_type or "").strip()
+    prefix = f"[{stay_label}] " if stay_label else ""
+    if reason == "start":
+        if spec.scan_all:
+            rooms_text = ", ".join(available_rooms) if available_rooms else "없음"
+            return f"감시 시작 {prefix}{spec.name} status={status} rooms={rooms_text}".strip()
+        if error_text:
+            return f"감시 시작 {prefix}{spec.name} status=error error={error_text}".strip()
+        return f"감시 시작 {prefix}{spec.name} status={status}".strip()
+    if reason == "rooms_changed":
+        rooms_text = ", ".join(available_rooms) if available_rooms else "없음"
+        return f"가용 객실 변경 {prefix}{spec.name} rooms={rooms_text}".strip()
+    return f"예약가능 {prefix}{spec.name}".strip()
+
+
+def should_hold_shutdown(monitor_manager: "MonitorManager | None") -> bool:
+    if monitor_manager is None:
+        return False
+    return monitor_manager.active_count() > 0
+
+
+class MonitorManager:
+    def __init__(
+        self,
+        monitor_logs: MonitorLogStore | None = None,
+        check_fn: Callable[..., dict[str, Any]] | None = None,
+        notify_fn: Callable[[str, str], dict[str, Any]] | None = None,
+        topic_getter: Callable[[], str] | None = None,
+    ) -> None:
+        self._monitor_logs = monitor_logs
+        if check_fn is None:
+            check_fn = check_room
+        if notify_fn is None:
+            notify_fn = send_ntfy_message
+        self._check_fn = check_fn
+        self._notify_fn = notify_fn
+        if topic_getter is None:
+            topic_getter = lambda: os.environ.get("NTFY_TOPIC", "").strip()
+        self._topic_getter = topic_getter
+        self._lock = threading.Lock()
+        self._records: dict[str, MonitorRecord] = {}
+        self._monitor_ids: dict[str, str] = {}
+        self._wake = threading.Event()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._running = False
+
+    def start(self) -> None:
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self._stop.clear()
+            self._running = True
+            self._thread = threading.Thread(target=self._run, name="monitor-scheduler", daemon=True)
+            self._thread.start()
+
+    def stop(self) -> None:
+        with self._lock:
+            thread = self._thread
+            self._running = False
+        self._stop.set()
+        self._wake.set()
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2.0)
+
+    def scheduler_status(self) -> dict[str, bool]:
+        with self._lock:
+            thread = self._thread
+            return {
+                "running": self._running,
+                "thread_alive": bool(thread and thread.is_alive()),
+            }
+
+    def active_count(self) -> int:
+        with self._lock:
+            return len(self._records)
+
+    def list_monitors(self) -> list[dict[str, Any]]:
+        with self._lock:
+            items = []
+            for record in self._records.values():
+                items.append(record.to_public())
+        items.sort(key=lambda item: ((item.get("name") or "").lower(), item.get("monitor_id") or ""))
+        return items
+
+    def list_user_monitors(self, user_id: str | None = None) -> list[dict[str, Any]]:
+        items = self.list_monitors()
+        if user_id is None:
+            return items
+        filtered = []
+        for item in items:
+            if item.get("user_id") == user_id:
+                filtered.append(item)
+        return filtered
+
+    def upsert(self, spec: MonitorSpec) -> tuple[dict[str, Any], bool]:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        next_run_iso = now_iso
+        next_run_mono = time.monotonic()
+        with self._lock:
+            monitor_id = self._monitor_ids.get(spec.target_key)
+            created = False
+            if monitor_id is None:
+                monitor_id = uuid.uuid4().hex
+                state = MonitorState(next_run_at=next_run_iso)
+                record = MonitorRecord(
+                    monitor_id=monitor_id,
+                    spec=spec,
+                    state=state,
+                    created_at=now_iso,
+                    updated_at=now_iso,
+                    start_notify_pending=spec.start_notify,
+                    next_run_mono=next_run_mono,
+                )
+                self._records[monitor_id] = record
+                self._monitor_ids[spec.target_key] = monitor_id
+                created = True
+            else:
+                record = self._records[monitor_id]
+                if record.spec.target_key != spec.target_key:
+                    self._monitor_ids.pop(record.spec.target_key, None)
+                    self._monitor_ids[spec.target_key] = monitor_id
+                record.spec = spec
+                record.updated_at = now_iso
+                record.start_notify_pending = record.start_notify_pending or spec.start_notify
+                record.next_run_mono = next_run_mono
+                record.state.next_run_at = next_run_iso
+            public = record.to_public()
+        self._wake.set()
+        return public, created
+
+    def stop_monitor(self, monitor_id: str, user_id: str | None = None) -> bool:
+        removed = False
+        with self._lock:
+            record = self._records.get(monitor_id)
+            if record is None:
+                return False
+            if user_id is not None and record.spec.user_id != user_id:
+                return False
+            self._records.pop(monitor_id, None)
+            if record is not None:
+                self._monitor_ids.pop(record.spec.target_key, None)
+                removed = True
+        if removed:
+            self._wake.set()
+        return removed
+
+    def run_due_once(self) -> bool:
+        job = self._claim_due()
+        if job is None:
+            return False
+        self._run_job(job)
+        return True
+
+    def run_all_due(self) -> int:
+        count = 0
+        while self.run_due_once():
+            count += 1
+        return count
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            if self.run_due_once():
+                continue
+            timeout = self._next_wait()
+            self._wake.wait(timeout=timeout)
+            self._wake.clear()
+        with self._lock:
+            self._running = False
+
+    def _next_wait(self) -> float:
+        now = time.monotonic()
+        wait_seconds = MONITOR_IDLE_WAIT_SECONDS
+        with self._lock:
+            has_pending = False
+            for record in self._records.values():
+                if record.running:
+                    continue
+                has_pending = True
+                delay = record.next_run_mono - now
+                if delay <= 0:
+                    return 0.0
+                if delay < wait_seconds:
+                    wait_seconds = delay
+        if not has_pending:
+            return MONITOR_IDLE_WAIT_SECONDS
+        if wait_seconds < 0:
+            return 0.0
+        return wait_seconds
+
+    def _claim_due(self) -> MonitorJob | None:
+        now = time.monotonic()
+        with self._lock:
+            chosen: MonitorRecord | None = None
+            for record in self._records.values():
+                if record.running:
+                    continue
+                if record.next_run_mono > now:
+                    continue
+                if chosen is None or record.next_run_mono < chosen.next_run_mono:
+                    chosen = record
+            if chosen is None:
+                return None
+            chosen.running = True
+            start_notify = chosen.start_notify_pending
+            chosen.start_notify_pending = False
+            return MonitorJob(
+                monitor_id=chosen.monitor_id,
+                spec=chosen.spec,
+                start_notify=start_notify,
+            )
+
+    def _run_job(self, job: MonitorJob) -> None:
+        started_at = time.perf_counter()
+        checked_at = datetime.now(timezone.utc).isoformat()
+        try:
+            result = self._check_fn(
+                job.spec.url,
+                job.spec.room_name,
+                job.spec.stay_type,
+                job.spec.check_in,
+                job.spec.check_out,
+                job.spec.scan_all,
+            )
+            status = str(result.get("status") or "unknown")
+            checked_url = str(result.get("url") or job.spec.url)
+            available_rooms = extract_available_rooms(result)
+            error_text = None
+            ok = True
+        except Exception as err:
+            result = None
+            status = "error"
+            checked_url = job.spec.url
+            available_rooms = []
+            error_text = str(err)
+            ok = False
+        self._append_log(
+            job=job,
+            ok=ok,
+            status=status,
+            checked_url=checked_url,
+            result=result,
+            error_text=error_text,
+            started_at=started_at,
+        )
+        self._finish_job(
+            job=job,
+            result=result,
+            status=status,
+            checked_at=checked_at,
+            available_rooms=available_rooms,
+            error_text=error_text,
+        )
+
+    def _append_log(
+        self,
+        job: MonitorJob,
+        ok: bool,
+        status: str,
+        checked_url: str,
+        result: dict[str, Any] | None,
+        error_text: str | None,
+        started_at: float,
+    ) -> None:
+        if self._monitor_logs is None:
+            return
+        match_count = None
+        available = None
+        if result is not None:
+            matches = result.get("matches")
+            if isinstance(matches, list):
+                match_count = len(matches)
+            available = bool(result.get("available"))
+        event = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "ok": ok,
+            "status": status,
+            "available": available,
+            "match_count": match_count,
+            "duration_ms": round((time.perf_counter() - started_at) * 1000, 1),
+            "url": checked_url,
+            "room_name": job.spec.room_name,
+            "scan_all": job.spec.scan_all,
+            "stay_type": job.spec.stay_type,
+            "check_in": job.spec.check_in,
+            "check_out": job.spec.check_out,
+            "user_id": job.spec.user_id,
+            "error": error_text,
+            "monitor_id": job.monitor_id,
+            "monitor_name": job.spec.name,
+            "mode": "background",
+        }
+        self._monitor_logs.append_check(event)
+
+    def _finish_job(
+        self,
+        job: MonitorJob,
+        result: dict[str, Any] | None,
+        status: str,
+        checked_at: str,
+        available_rooms: list[str],
+        error_text: str | None,
+    ) -> None:
+        with self._lock:
+            record = self._records.get(job.monitor_id)
+            if record is None:
+                return
+            previous_status = record.state.last_status
+            previous_rooms = list(record.state.last_available_rooms)
+            current_spec = record.spec
+            record.state.last_result = result
+            record.state.last_status = status
+            record.state.last_checked_at = checked_at
+            record.state.last_error = error_text
+            record.state.last_available_rooms = list(available_rooms)
+            record.updated_at = checked_at
+            record.running = False
+            record.next_run_mono = time.monotonic() + current_spec.interval_seconds
+            record.state.next_run_at = (
+                datetime.now(timezone.utc) + timedelta(seconds=current_spec.interval_seconds)
+            ).isoformat()
+            notify_reason = None
+            if job.start_notify:
+                notify_reason = "start"
+            elif current_spec.scan_all:
+                if previous_status is not None and previous_rooms != available_rooms:
+                    notify_reason = "rooms_changed"
+            elif status == "available" and previous_status not in {None, "available"}:
+                notify_reason = "available"
+            notify_spec = current_spec
+        if notify_reason:
+            self._notify(notify_spec, status, available_rooms, error_text, notify_reason)
+
+    def _notify(
+        self,
+        spec: MonitorSpec,
+        status: str,
+        available_rooms: list[str],
+        error_text: str | None,
+        reason: str,
+    ) -> None:
+        topic = self._topic_getter()
+        if not topic:
+            return
+        message = build_monitor_message(spec, status, available_rooms, error_text, reason)
+        result = self._notify_fn(topic, message)
+        if result.get("ok"):
+            return
+        print(f"Monitor notification failed: {result.get('error')}", flush=True)
 
 
 def load_env(path: Path) -> None:
@@ -598,6 +1218,12 @@ class Handler(SimpleHTTPRequestHandler):
             return monitor_logs
         return None
 
+    def _get_monitor_manager(self) -> MonitorManager | None:
+        monitor_manager = getattr(self.server, "monitor_manager", None)
+        if isinstance(monitor_manager, MonitorManager):
+            return monitor_manager
+        return None
+
     def _is_shutdown_allowed(self) -> bool:
         return bool(getattr(self.server, "allow_shutdown_api", False))
 
@@ -655,6 +1281,37 @@ class Handler(SimpleHTTPRequestHandler):
                 active_sessions, events = tracker.end(safe_session_id)
             dispatch_disconnect_events(events)
             self._send_json({"ok": True, "active_sessions": active_sessions})
+            return
+
+        if self.path == "/monitors/start":
+            monitor_manager = self._get_monitor_manager()
+            if monitor_manager is None:
+                self._send_json({"ok": False, "error": "Monitor manager unavailable"}, status=503)
+                return
+            topic = os.environ.get("NTFY_TOPIC", "").strip()
+            spec, error = parse_monitor_start(payload, topic)
+            if error:
+                self._send_json({"ok": False, "error": error}, status=400)
+                return
+            monitor, created = monitor_manager.upsert(spec)
+            self._send_json({"ok": True, "created": created, "monitor": monitor, "monitor_id": monitor["monitor_id"]})
+            return
+
+        if self.path == "/monitors/stop":
+            monitor_manager = self._get_monitor_manager()
+            if monitor_manager is None:
+                self._send_json({"ok": False, "error": "Monitor manager unavailable"}, status=503)
+                return
+            stop_args, error = parse_monitor_stop(payload)
+            if error:
+                self._send_json({"ok": False, "error": error}, status=400)
+                return
+            monitor_id, user_id = stop_args
+            removed = monitor_manager.stop_monitor(monitor_id, user_id=user_id)
+            if not removed:
+                self._send_json({"ok": False, "error": "Monitor not found"}, status=404)
+                return
+            self._send_json({"ok": True, "monitor_id": monitor_id})
             return
 
         if self.path == "/check":
@@ -749,15 +1406,38 @@ class Handler(SimpleHTTPRequestHandler):
             active_sessions = tracker.active_count() if tracker else 0
             monitor_logs = self._get_monitor_logs()
             monitor_summary = monitor_logs.summary() if monitor_logs else None
+            monitor_manager = self._get_monitor_manager()
+            active_monitors = monitor_manager.active_count() if monitor_manager else 0
+            scheduler = monitor_manager.scheduler_status() if monitor_manager else {
+                "running": False,
+                "thread_alive": False,
+            }
             self._send_json(
                 {
                     "ok": True,
                     "service": SERVICE_NAME,
                     "active_sessions": active_sessions,
+                    "active_monitors": active_monitors,
+                    "scheduler": scheduler,
                     "shutdown_supported": self._is_shutdown_allowed(),
                     "monitoring": monitor_summary,
                 }
             )
+            return
+        if parsed.path == "/monitors":
+            monitor_manager = self._get_monitor_manager()
+            if monitor_manager is None:
+                self._send_json({"ok": False, "error": "Monitor manager unavailable"}, status=503)
+                return
+            query = urllib.parse.parse_qs(parsed.query)
+            raw_user_id = query.get("user_id", [None])[0]
+            user_id = None
+            if raw_user_id is not None:
+                user_id, error = normalize_monitor_text(raw_user_id, "user_id")
+                if error or not user_id:
+                    self._send_json({"ok": False, "error": "Missing user_id"}, status=400)
+                    return
+            self._send_json({"ok": True, "monitors": monitor_manager.list_user_monitors(user_id=user_id)})
             return
         if parsed.path == "/monitor/logs":
             monitor_logs = self._get_monitor_logs()
@@ -787,11 +1467,13 @@ def create_server(
     port: int,
     session_tracker: SessionTracker | None = None,
     monitor_logs: MonitorLogStore | None = None,
+    monitor_manager: MonitorManager | None = None,
     allow_shutdown_api: bool = False,
 ) -> ThreadingHTTPServer:
     server = ThreadingHTTPServer((host, port), Handler)
     server.session_tracker = session_tracker
     server.monitor_logs = monitor_logs
+    server.monitor_manager = monitor_manager
     server.allow_shutdown_api = bool(allow_shutdown_api)
     return server
 
@@ -805,6 +1487,9 @@ def _start_shutdown_watcher(server: ThreadingHTTPServer, tracker: SessionTracker
             time.sleep(1.0)
             events = tracker.collect_timeout_events()
             dispatch_disconnect_events(events)
+            monitor_manager = getattr(server, "monitor_manager", None)
+            if should_hold_shutdown(monitor_manager):
+                continue
             if tracker.should_shutdown():
                 print("No active browser sessions detected. Shutting down server.", flush=True)
                 server.shutdown()
@@ -834,13 +1519,16 @@ def run_server(
     )
     data_dir = resolve_data_dir()
     monitor_logs = MonitorLogStore(data_dir=data_dir)
+    monitor_manager = MonitorManager(monitor_logs=monitor_logs)
     server = create_server(
         host,
         port,
         session_tracker=tracker,
         monitor_logs=monitor_logs,
+        monitor_manager=monitor_manager,
         allow_shutdown_api=allow_shutdown_api,
     )
+    monitor_manager.start()
     print(f"Serving on http://{host}:{port}", flush=True)
     print(f"Env path: {resolved_env_path}", flush=True)
     print(f"Monitor logs: {monitor_logs.log_path}", flush=True)
@@ -854,7 +1542,10 @@ def run_server(
     if allow_shutdown_api:
         print("Shutdown API enabled (POST /server/shutdown)", flush=True)
     _start_shutdown_watcher(server, tracker)
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    finally:
+        monitor_manager.stop()
 
 
 def parse_args() -> argparse.Namespace:
