@@ -1,0 +1,388 @@
+from __future__ import annotations
+
+import json
+import os
+import tempfile
+import threading
+import time
+import unittest
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+from web import server
+
+
+class QueueCheck:
+    def __init__(self) -> None:
+        self.items: list[object] = []
+
+    def push_result(self, result: dict[str, object]) -> None:
+        self.items.append(result)
+
+    def push_error(self, error: Exception) -> None:
+        self.items.append(error)
+
+    def __call__(
+        self,
+        url: str,
+        room_name: str | None,
+        stay_type: str | None,
+        check_in: str | None,
+        check_out: str | None,
+        scan_all: bool,
+    ) -> dict[str, object]:
+        if self.items:
+            item = self.items.pop(0)
+            if isinstance(item, Exception):
+                raise item
+            return item
+        return {
+            "available": False,
+            "status": "closed",
+            "matches": [],
+            "url": url,
+        }
+
+
+def make_payload(**overrides: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "user_id": "user-a",
+        "name": "watch-one",
+        "url": "https://example.com/room",
+        "room_name": "Deluxe",
+        "scan_all": False,
+        "stay_type": None,
+        "check_in": None,
+        "check_out": None,
+        "interval_seconds": 30,
+        "start_notify": False,
+        "ntfy_enabled": True,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def make_spec(**overrides: object) -> server.MonitorSpec:
+    payload = make_payload(**overrides)
+    spec, error = server.parse_monitor_start(payload, "topic")
+    if error:
+        raise AssertionError(error)
+    return spec
+
+
+def force_due(manager: server.MonitorManager, monitor_id: str) -> None:
+    with manager._lock:
+        record = manager._records[monitor_id]
+        record.next_run_mono = time.monotonic() - 1.0
+        record.state.next_run_at = "due"
+
+
+class MonitorManagerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.logs = server.MonitorLogStore(Path(self.tmpdir.name))
+        self.check = QueueCheck()
+        self.notify_calls: list[tuple[str, str]] = []
+        self.manager = server.MonitorManager(
+            monitor_logs=self.logs,
+            check_fn=self.check,
+            notify_fn=self.fake_notify,
+            topic_getter=lambda: "topic",
+        )
+
+    def tearDown(self) -> None:
+        self.manager.stop()
+        self.tmpdir.cleanup()
+
+    def fake_notify(self, topic: str, message: str) -> dict[str, object]:
+        self.notify_calls.append((topic, message))
+        return {"ok": True}
+
+    def test_upsert_reuses_monitor_id_for_same_target(self) -> None:
+        first, created = self.manager.upsert(make_spec())
+        second, created_again = self.manager.upsert(
+            make_spec(name="watch-two", interval_seconds=10, start_notify=True)
+        )
+
+        self.assertTrue(created)
+        self.assertFalse(created_again)
+        self.assertEqual(first["monitor_id"], second["monitor_id"])
+        monitors = self.manager.list_monitors()
+        self.assertEqual(1, len(monitors))
+        self.assertEqual("watch-two", monitors[0]["name"])
+        self.assertEqual(10, monitors[0]["interval_seconds"])
+
+    def test_upsert_creates_distinct_monitor_for_different_target(self) -> None:
+        first, _ = self.manager.upsert(make_spec())
+        second, _ = self.manager.upsert(make_spec(url="https://example.com/other"))
+
+        self.assertNotEqual(first["monitor_id"], second["monitor_id"])
+        self.assertEqual(2, self.manager.active_count())
+
+    def test_upsert_creates_distinct_monitor_for_different_user(self) -> None:
+        first, _ = self.manager.upsert(make_spec())
+        second, _ = self.manager.upsert(make_spec(user_id="user-b"))
+
+        self.assertNotEqual(first["monitor_id"], second["monitor_id"])
+        self.assertEqual(2, self.manager.active_count())
+
+    def test_stop_monitor_removes_record(self) -> None:
+        monitor, _ = self.manager.upsert(make_spec())
+
+        removed = self.manager.stop_monitor(monitor["monitor_id"], user_id="user-a")
+
+        self.assertTrue(removed)
+        self.assertEqual(0, self.manager.active_count())
+        self.assertEqual([], self.manager.list_monitors())
+
+    def test_single_monitor_notifies_on_closed_to_available_transition(self) -> None:
+        self.check.push_result(
+            {
+                "available": False,
+                "status": "closed",
+                "matches": [],
+                "url": "https://example.com/room",
+            }
+        )
+        self.check.push_result(
+            {
+                "available": True,
+                "status": "available",
+                "matches": [{"h2_text": "Deluxe", "has_book": True}],
+                "url": "https://example.com/room",
+            }
+        )
+        self.check.push_result(
+            {
+                "available": True,
+                "status": "available",
+                "matches": [{"h2_text": "Deluxe", "has_book": True}],
+                "url": "https://example.com/room",
+            }
+        )
+        monitor, _ = self.manager.upsert(make_spec())
+
+        self.assertEqual(1, self.manager.run_all_due())
+        force_due(self.manager, monitor["monitor_id"])
+        self.assertEqual(1, self.manager.run_all_due())
+        force_due(self.manager, monitor["monitor_id"])
+        self.assertEqual(1, self.manager.run_all_due())
+
+        self.assertEqual(1, len(self.notify_calls))
+        self.assertIn("예약가능", self.notify_calls[0][1])
+
+    def test_scan_all_notifies_on_available_room_changes(self) -> None:
+        self.check.push_result(
+            {
+                "available": True,
+                "status": "available",
+                "matches": [{"h2_text": "A", "has_book": True}],
+                "url": "https://example.com/room",
+            }
+        )
+        self.check.push_result(
+            {
+                "available": True,
+                "status": "available",
+                "matches": [{"h2_text": "A", "has_book": True}],
+                "url": "https://example.com/room",
+            }
+        )
+        self.check.push_result(
+            {
+                "available": True,
+                "status": "available",
+                "matches": [
+                    {"h2_text": "A", "has_book": True},
+                    {"h2_text": "B", "has_book": True},
+                ],
+                "url": "https://example.com/room",
+            }
+        )
+        self.check.push_result(
+            {
+                "available": False,
+                "status": "closed",
+                "matches": [],
+                "url": "https://example.com/room",
+            }
+        )
+        monitor, _ = self.manager.upsert(make_spec(scan_all=True, room_name=None))
+
+        self.manager.run_all_due()
+        force_due(self.manager, monitor["monitor_id"])
+        self.manager.run_all_due()
+        force_due(self.manager, monitor["monitor_id"])
+        self.manager.run_all_due()
+        force_due(self.manager, monitor["monitor_id"])
+        self.manager.run_all_due()
+
+        self.assertEqual(2, len(self.notify_calls))
+        self.assertIn("가용 객실 변경", self.notify_calls[0][1])
+        self.assertIn("B", self.notify_calls[0][1])
+        self.assertIn("없음", self.notify_calls[1][1])
+
+    def test_failed_check_updates_error_and_keeps_monitor(self) -> None:
+        self.check.push_error(RuntimeError("boom"))
+        monitor, _ = self.manager.upsert(make_spec())
+
+        self.manager.run_all_due()
+
+        monitors = self.manager.list_monitors()
+        self.assertEqual(1, self.manager.active_count())
+        self.assertEqual(monitor["monitor_id"], monitors[0]["monitor_id"])
+        self.assertEqual("error", monitors[0]["last_status"])
+        self.assertEqual("boom", monitors[0]["last_error"])
+
+    def test_should_hold_shutdown_when_monitor_active(self) -> None:
+        monitor, _ = self.manager.upsert(make_spec())
+
+        self.assertTrue(server.should_hold_shutdown(self.manager))
+
+        self.manager.stop_monitor(monitor["monitor_id"], user_id="user-a")
+        self.assertFalse(server.should_hold_shutdown(self.manager))
+
+
+class ApiTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.logs = server.MonitorLogStore(Path(self.tmpdir.name))
+        self.check = QueueCheck()
+        self.manager = server.MonitorManager(
+            monitor_logs=self.logs,
+            check_fn=self.check,
+            notify_fn=lambda topic, message: {"ok": True},
+            topic_getter=lambda: "topic",
+        )
+        self.httpd = server.create_server(
+            "127.0.0.1",
+            0,
+            session_tracker=server.SessionTracker(enabled=False),
+            monitor_logs=self.logs,
+            monitor_manager=self.manager,
+        )
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+        self.base_url = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+        self.prev_topic = os.environ.get("NTFY_TOPIC")
+        os.environ["NTFY_TOPIC"] = "topic"
+
+    def tearDown(self) -> None:
+        if self.prev_topic is None:
+            os.environ.pop("NTFY_TOPIC", None)
+        else:
+            os.environ["NTFY_TOPIC"] = self.prev_topic
+        self.httpd.shutdown()
+        self.thread.join(timeout=2.0)
+        self.httpd.server_close()
+        self.tmpdir.cleanup()
+
+    def post_json(self, path: str, payload: dict[str, object]) -> tuple[int, dict[str, object]]:
+        request = urllib.request.Request(
+            f"{self.base_url}{path}",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=3.0) as response:
+                body = json.loads(response.read().decode("utf-8"))
+                return response.status, body
+        except urllib.error.HTTPError as err:
+            body = json.loads(err.read().decode("utf-8"))
+            status = err.code
+            err.close()
+            return status, body
+
+    def get_json(self, path: str) -> tuple[int, dict[str, object]]:
+        request = urllib.request.Request(f"{self.base_url}{path}", method="GET")
+        with urllib.request.urlopen(request, timeout=3.0) as response:
+            body = json.loads(response.read().decode("utf-8"))
+            return response.status, body
+
+    def test_start_monitor_accepts_valid_request(self) -> None:
+        status, body = self.post_json("/monitors/start", make_payload())
+
+        self.assertEqual(200, status)
+        self.assertTrue(body["ok"])
+        self.assertTrue(body["created"])
+        self.assertIsNotNone(body["monitor_id"])
+        self.assertEqual("user-a", body["monitor"]["user_id"])
+
+    def test_start_monitor_rejects_ntfy_disabled(self) -> None:
+        status, body = self.post_json("/monitors/start", make_payload(ntfy_enabled=False))
+
+        self.assertEqual(400, status)
+        self.assertFalse(body["ok"])
+        self.assertIn("ntfy_enabled", body["error"])
+
+    def test_start_monitor_rejects_invalid_requests(self) -> None:
+        cases = [
+            make_payload(user_id=""),
+            make_payload(url=""),
+            make_payload(interval_seconds=0),
+            make_payload(room_name=None, scan_all=False),
+        ]
+
+        for payload in cases:
+            status, body = self.post_json("/monitors/start", payload)
+            self.assertEqual(400, status)
+            self.assertFalse(body["ok"])
+
+    def test_monitors_list_and_stop(self) -> None:
+        _, start_body = self.post_json("/monitors/start", make_payload())
+        self.post_json("/monitors/start", make_payload(user_id="user-b", url="https://example.com/other"))
+
+        status, list_body = self.get_json("/monitors?user_id=user-a")
+        self.assertEqual(200, status)
+        self.assertEqual(1, len(list_body["monitors"]))
+        self.assertEqual("user-a", list_body["monitors"][0]["user_id"])
+
+        stop_status, stop_body = self.post_json(
+            "/monitors/stop",
+            {"monitor_id": start_body["monitor_id"], "user_id": "user-a"},
+        )
+        self.assertEqual(200, stop_status)
+        self.assertTrue(stop_body["ok"])
+
+        _, after_body = self.get_json("/monitors?user_id=user-a")
+        self.assertEqual([], after_body["monitors"])
+
+        _, other_body = self.get_json("/monitors?user_id=user-b")
+        self.assertEqual(1, len(other_body["monitors"]))
+
+    def test_stop_missing_monitor_returns_404(self) -> None:
+        status, body = self.post_json("/monitors/stop", {"monitor_id": "missing", "user_id": "user-a"})
+
+        self.assertEqual(404, status)
+        self.assertFalse(body["ok"])
+        self.assertEqual("Monitor not found", body["error"])
+
+    def test_stop_with_other_user_returns_404(self) -> None:
+        _, start_body = self.post_json("/monitors/start", make_payload())
+
+        status, body = self.post_json(
+            "/monitors/stop",
+            {"monitor_id": start_body["monitor_id"], "user_id": "user-b"},
+        )
+
+        self.assertEqual(404, status)
+        self.assertFalse(body["ok"])
+        self.assertEqual("Monitor not found", body["error"])
+
+    def test_health_exposes_active_monitors_and_scheduler(self) -> None:
+        self.post_json("/monitors/start", make_payload())
+
+        status, body = self.get_json("/health")
+
+        self.assertEqual(200, status)
+        self.assertTrue(body["ok"])
+        self.assertEqual(1, body["active_monitors"])
+        self.assertIn("scheduler", body)
+        self.assertIn("running", body["scheduler"])
+        self.assertIn("thread_alive", body["scheduler"])
+
+
+if __name__ == "__main__":
+    unittest.main()
