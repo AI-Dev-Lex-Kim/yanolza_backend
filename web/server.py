@@ -10,6 +10,7 @@ import ssl
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -44,9 +45,9 @@ SESSION_TIMEOUT_SECONDS = 45.0
 SHUTDOWN_GRACE_SECONDS = 3.0
 MONITOR_LOG_FILE_NAME = "monitor_history.jsonl"
 MONITOR_STATE_FILE_NAME = "monitor_history_state.json"
-MONITOR_KEEP_LIMIT = 10
-DEFAULT_LOG_LIMIT = 60
-MAX_LOG_LIMIT = 500
+MONITOR_KEEP_LIMIT = 180
+DEFAULT_LOG_LIMIT = 180
+MAX_LOG_LIMIT = 180
 MONITOR_IDLE_WAIT_SECONDS = 1.0
 MONITOR_START_FIELDS = {
     "user_id",
@@ -500,13 +501,13 @@ def build_monitor_message(
     if reason == "start":
         if spec.scan_all:
             rooms_text = ", ".join(available_rooms) if available_rooms else "없음"
-            return f"감시 시작 {prefix}{spec.name} status={status} rooms={rooms_text}".strip()
+            return f"감시 시작 {prefix}{spec.name} status={status} {rooms_text}".strip()
         if error_text:
             return f"감시 시작 {prefix}{spec.name} status=error error={error_text}".strip()
         return f"감시 시작 {prefix}{spec.name} status={status}".strip()
     if reason == "rooms_changed":
         rooms_text = ", ".join(available_rooms) if available_rooms else "없음"
-        return f"가용 객실 변경 {prefix}{spec.name} rooms={rooms_text}".strip()
+        return f"예약 가능 객실 변경 {prefix}{spec.name} {rooms_text}".strip()
     return f"예약가능 {prefix}{spec.name}".strip()
 
 
@@ -820,9 +821,12 @@ class MonitorManager:
             if job.start_notify:
                 notify_reason = "start"
             elif current_spec.scan_all:
-                if previous_status is not None and previous_rooms != available_rooms:
-                    notify_reason = "rooms_changed"
-            elif status == "available" and previous_status not in {None, "available"}:
+                if previous_rooms != available_rooms:
+                    if available_rooms and not previous_rooms:
+                        notify_reason = "available"
+                    elif previous_status is not None:
+                        notify_reason = "rooms_changed"
+            elif status == "available" and previous_status != "available":
                 notify_reason = "available"
             notify_spec = current_spec
         if notify_reason:
@@ -1142,31 +1146,29 @@ def check_room(
 
 
 def send_ntfy_message(topic: str, text: str) -> dict[str, Any]:
-    try:
-        import requests
-    except ModuleNotFoundError:
-        return {"ok": False, "error": "requests package is not installed"}
     safe_text = (text or "").strip()
     if not topic:
         return {"ok": False, "error": "NTFY topic missing"}
     if not safe_text:
         return {"ok": False, "error": "message missing"}
+    request = urllib.request.Request(
+        f"{NTFY_BASE_URL}/{topic}",
+        headers={"Priority": "high"},
+        data=safe_text.encode("utf-8"),
+        method="POST",
+    )
     try:
-        response = requests.post(
-            f"{NTFY_BASE_URL}/{topic}",
-            headers={"Priority": "high"},
-            data=safe_text,
-            timeout=10,
-        )
-        response.raise_for_status()
-    except requests.RequestException as err:
-        error_text = ""
-        if err.response is not None:
-            error_text = (err.response.text or "").strip()
+        with urllib.request.urlopen(request, timeout=10) as response:
+            body = response.read().decode("utf-8", errors="ignore").strip()
+    except urllib.error.HTTPError as err:
+        error_text = err.read().decode("utf-8", errors="ignore").strip()
         if not error_text:
             error_text = str(err)
         return {"ok": False, "error": error_text}
-    return {"ok": True, "response": (response.text or "").strip()}
+    except urllib.error.URLError as err:
+        error_text = str(err)
+        return {"ok": False, "error": error_text}
+    return {"ok": True, "response": body}
 
 
 def build_disconnect_alert_message(event: SessionEvent) -> str:
