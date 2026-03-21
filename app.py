@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import time
 import urllib.request
 import ssl
@@ -77,13 +78,18 @@ class YanoljaHtmlProvider:
         url = item.criteria.get("url")
         room_name = item.criteria.get("room_name")
         stay_type = item.criteria.get("stay_type")
+        dayuse_end_time = item.criteria.get("dayuse_end_time")
         scan_all = bool(item.criteria.get("scan_all"))
         if not url:
             return Availability(available=False, price=None, source="yanolja-html")
         html = self._fetch_html(url)
         detector = RoomAvailabilityDetector(room_name)
         detector.feed(html)
-        available, details = detector.evaluate(stay_type=stay_type, scan_all=scan_all)
+        available, details = detector.evaluate(
+            stay_type=stay_type,
+            scan_all=scan_all,
+            dayuse_end_time=dayuse_end_time,
+        )
         if self._debug:
             self._print_debug(item, details)
         return Availability(available=available, price=None, source="yanolja-html")
@@ -114,6 +120,7 @@ class YanoljaHtmlProvider:
         print(f"  item_id: {item.item_id}")
         print(f"  room_name: {item.criteria.get('room_name')}")
         print(f"  stay_type: {item.criteria.get('stay_type')}")
+        print(f"  dayuse_end_time: {item.criteria.get('dayuse_end_time')}")
         if not details:
             print("  matches: 0")
             return
@@ -126,6 +133,8 @@ class YanoljaHtmlProvider:
             print(f"    stay_type_match: {detail.get('stay_type_match')}")
             print(f"    stay_type_nodes: {detail.get('stay_type_nodes')}")
             print(f"    stay_type_scopes: {detail.get('stay_type_scopes')}")
+            print(f"    dayuse_end_times: {detail.get('dayuse_end_times')}")
+            print(f"    dayuse_end_time_match: {detail.get('dayuse_end_time_match')}")
 
 
 class HtmlNode:
@@ -273,7 +282,10 @@ class RoomAvailabilityDetector(HTMLParser):
         self.current.add_text(data)
 
     def evaluate(
-        self, stay_type: str | None = None, scan_all: bool = False
+        self,
+        stay_type: str | None = None,
+        scan_all: bool = False,
+        dayuse_end_time: str | None = None,
     ) -> tuple[bool, list[dict[str, Any]]]:
         if not self.room_name and not scan_all:
             return False, []
@@ -344,6 +356,8 @@ class RoomAvailabilityDetector(HTMLParser):
             has_book = False
             has_closed = False
             matched_scopes = 0
+            time_match = dayuse_end_time is None
+            end_times: list[str] = []
             for scope in scope_nodes:
                 reservation_scope = scope
                 if stay_type:
@@ -352,6 +366,20 @@ class RoomAvailabilityDetector(HTMLParser):
                     )
                     if reservation_scope is None:
                         continue
+                end_time = None
+                if stay_type == "대실":
+                    found = re.search(
+                        r"운영시간\s*([0-2]?\d:\d{2})\s*~\s*([0-2]?\d:\d{2})",
+                        reservation_scope.get_text(),
+                    )
+                    if found is not None:
+                        end_time = found.group(2)
+                        if end_time not in end_times:
+                            end_times.append(end_time)
+                if dayuse_end_time is not None:
+                    if end_time != dayuse_end_time:
+                        continue
+                    time_match = True
                 matched_scopes += 1
                 nodes = [reservation_scope] + reservation_scope.descendants()
                 for node in nodes:
@@ -369,9 +397,11 @@ class RoomAvailabilityDetector(HTMLParser):
                     "stay_type_match": stay_match,
                     "stay_type_nodes": len(stay_nodes) if stay_type else None,
                     "stay_type_scopes": matched_scopes if stay_type else None,
+                    "dayuse_end_times": end_times or None,
+                    "dayuse_end_time_match": time_match,
                 }
             )
-            if stay_match and has_book:
+            if stay_match and time_match and has_book:
                 available = True
         return available, details
 
