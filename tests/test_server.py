@@ -10,8 +10,52 @@ import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from unittest import mock
 
 from web import server
+
+DAYUSE_HTML = """
+<div id="PLACE_SECTION_DAYUSE">
+  <div>
+    <div>
+      <div>
+        <div>
+          <div>
+            <div>
+              <h2>Deluxe 21</h2>
+              <div>
+                <div>대실</div>
+                <div>상세보기</div>
+                <div>최대 5시간</div>
+                <div>(운영시간 12:00 ~ 21:00)</div>
+                <div>예약하기</div>
+              </div>
+              <div>
+                <div>숙박</div>
+                <div>예약마감</div>
+              </div>
+            </div>
+            <div>
+              <h2>Deluxe 22</h2>
+              <div>
+                <div>대실</div>
+                <div>상세보기</div>
+                <div>최대 5시간</div>
+                <div>(운영시간 12:00 ~ 22:00)</div>
+                <div>예약하기</div>
+              </div>
+              <div>
+                <div>숙박</div>
+                <div>예약마감</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+"""
 
 
 class QueueCheck:
@@ -31,6 +75,7 @@ class QueueCheck:
         stay_type: str | None,
         check_in: str | None,
         check_out: str | None,
+        dayuse_end_time: str | None,
         scan_all: bool,
     ) -> dict[str, object]:
         if self.items:
@@ -62,6 +107,7 @@ class TimedCheck:
         stay_type: str | None,
         check_in: str | None,
         check_out: str | None,
+        dayuse_end_time: str | None,
         scan_all: bool,
     ) -> dict[str, object]:
         if self.start_at is None:
@@ -121,6 +167,7 @@ def make_payload(**overrides: object) -> dict[str, object]:
         "stay_type": None,
         "check_in": None,
         "check_out": None,
+        "dayuse_end_time": None,
         "interval_seconds": 30,
         "start_notify": False,
         "ntfy_enabled": True,
@@ -142,6 +189,44 @@ def force_due(manager: server.MonitorManager, monitor_id: str) -> None:
         record = manager._records[monitor_id]
         record.next_run_mono = time.monotonic() - 1.0
         record.state.next_run_at = "due"
+
+
+class CheckRoomTests(unittest.TestCase):
+    def test_check_room_filters_dayuse_end_time(self) -> None:
+        with mock.patch.object(server, "fetch_html", return_value=DAYUSE_HTML):
+            result = server.check_room(
+                "https://example.com/room",
+                "Deluxe",
+                "대실",
+                None,
+                None,
+                "22:00",
+                False,
+            )
+
+        self.assertTrue(result["available"])
+        self.assertEqual("available", result["status"])
+        self.assertTrue(result["dayuse_end_time_found"])
+        self.assertEqual(1, len(result["matches"]))
+        self.assertEqual("Deluxe 22", result["matches"][0]["h2_text"])
+        self.assertEqual(["22:00"], result["matches"][0]["dayuse_end_times"])
+
+    def test_check_room_returns_not_found_for_missing_dayuse_end_time(self) -> None:
+        with mock.patch.object(server, "fetch_html", return_value=DAYUSE_HTML):
+            result = server.check_room(
+                "https://example.com/room",
+                "Deluxe",
+                "대실",
+                None,
+                None,
+                "23:00",
+                False,
+            )
+
+        self.assertFalse(result["available"])
+        self.assertEqual("dayuse_end_time_not_found", result["status"])
+        self.assertFalse(result["dayuse_end_time_found"])
+        self.assertEqual([], result["matches"])
 
 
 class MonitorManagerTests(unittest.TestCase):
@@ -189,6 +274,13 @@ class MonitorManagerTests(unittest.TestCase):
     def test_upsert_creates_distinct_monitor_for_different_user(self) -> None:
         first, _ = self.manager.upsert(make_spec())
         second, _ = self.manager.upsert(make_spec(user_id="user-b"))
+
+        self.assertNotEqual(first["monitor_id"], second["monitor_id"])
+        self.assertEqual(2, self.manager.active_count())
+
+    def test_upsert_creates_distinct_monitor_for_different_dayuse_end_time(self) -> None:
+        first, _ = self.manager.upsert(make_spec(stay_type="대실", dayuse_end_time="21:00"))
+        second, _ = self.manager.upsert(make_spec(stay_type="대실", dayuse_end_time="22:00"))
 
         self.assertNotEqual(first["monitor_id"], second["monitor_id"])
         self.assertEqual(2, self.manager.active_count())
@@ -560,12 +652,30 @@ class ApiTests(unittest.TestCase):
             make_payload(url=""),
             make_payload(interval_seconds=0),
             make_payload(room_name=None, scan_all=False),
+            make_payload(stay_type="대실", dayuse_end_time="bad"),
+            make_payload(dayuse_end_time="22:00"),
         ]
 
         for payload in cases:
             status, body = self.post_json("/monitors/start", payload)
             self.assertEqual(400, status)
             self.assertFalse(body["ok"])
+
+    def test_check_rejects_dayuse_end_time_without_dayuse_stay_type(self) -> None:
+        status, body = self.post_json(
+            "/check",
+            {
+                "url": "https://example.com/room",
+                "room_name": "Deluxe",
+                "scan_all": False,
+                "stay_type": "숙박",
+                "dayuse_end_time": "22:00",
+            },
+        )
+
+        self.assertEqual(400, status)
+        self.assertFalse(body["ok"])
+        self.assertIn("dayuse_end_time", body["error"])
 
     def test_monitors_list_and_stop(self) -> None:
         _, start_body = self.post_json("/monitors/start", make_payload())
