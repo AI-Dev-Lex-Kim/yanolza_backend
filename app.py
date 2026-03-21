@@ -20,6 +20,84 @@ from typing import Any
 NTFY_BASE_URL = "https://ntfy.sh"
 
 
+def parse_dayuse_end_filter(
+    value: str | None,
+) -> tuple[str | None, tuple[int, int] | None, str | None]:
+    text = str(value or "").strip()
+    if not text:
+        return None, None, None
+    lowered = text.lower()
+    if lowered in {"any", "all"} or text in {"상관없음", "무관", "전체"}:
+        return None, None, None
+
+    def parse_piece(
+        raw: str,
+        mode: str,
+        default_mark: str | None = None,
+    ) -> tuple[int | None, str | None]:
+        part = raw.strip()
+        if not part:
+            return None, default_mark
+        mark = default_mark
+        lowered_part = part.lower()
+        if lowered_part.startswith("오전"):
+            mark = "am"
+            part = part[2:].strip()
+        elif lowered_part.startswith("오후"):
+            mark = "pm"
+            part = part[2:].strip()
+        elif lowered_part.startswith("am"):
+            mark = "am"
+            part = part[2:].strip()
+        elif lowered_part.startswith("pm"):
+            mark = "pm"
+            part = part[2:].strip()
+        match = re.fullmatch(r"(\d{1,2})(?::(\d{2}))?", part)
+        if match is None:
+            return None, mark
+        hour = int(match.group(1))
+        minute_text = match.group(2)
+        minute = 0
+        if minute_text is None:
+            if mode == "end":
+                minute = 59
+        else:
+            minute = int(minute_text)
+        if minute > 59:
+            return None, mark
+        if mark is None:
+            if hour > 23:
+                return None, mark
+            return (hour * 60) + minute, mark
+        if hour < 1 or hour > 12:
+            return None, mark
+        if mark == "am":
+            if hour == 12:
+                hour = 0
+        elif hour != 12:
+            hour += 12
+        return (hour * 60) + minute, mark
+
+    if "~" in text or "-" in text:
+        parts = re.split(r"\s*(?:~|-)\s*", text, maxsplit=1)
+        if len(parts) != 2:
+            return text, None, "Invalid dayuse_end_time"
+        start_time, start_mark = parse_piece(parts[0], "start")
+        end_time, end_mark = parse_piece(parts[1], "end", default_mark=start_mark)
+        if start_time is None and end_mark is not None:
+            start_time, start_mark = parse_piece(parts[0], "start", default_mark=end_mark)
+        if end_time is None and start_mark is not None:
+            end_time, end_mark = parse_piece(parts[1], "end", default_mark=start_mark)
+        if start_time is None or end_time is None or start_time > end_time:
+            return text, None, "Invalid dayuse_end_time"
+        return text, (start_time, end_time), None
+
+    exact_time, _ = parse_piece(text, "exact")
+    if exact_time is None:
+        return text, None, "Invalid dayuse_end_time"
+    return text, (exact_time, exact_time), None
+
+
 @dataclass(frozen=True)
 class WatchItem:
     item_id: str
@@ -287,6 +365,9 @@ class RoomAvailabilityDetector(HTMLParser):
         scan_all: bool = False,
         dayuse_end_time: str | None = None,
     ) -> tuple[bool, list[dict[str, Any]]]:
+        _, dayuse_range, dayuse_error = parse_dayuse_end_filter(dayuse_end_time)
+        if dayuse_error is not None:
+            return False, []
         if not self.room_name and not scan_all:
             return False, []
         excluded_h2_phrases = [
@@ -356,7 +437,7 @@ class RoomAvailabilityDetector(HTMLParser):
             has_book = False
             has_closed = False
             matched_scopes = 0
-            time_match = dayuse_end_time is None
+            time_match = dayuse_range is None
             end_times: list[str] = []
             for scope in scope_nodes:
                 reservation_scope = scope
@@ -376,8 +457,12 @@ class RoomAvailabilityDetector(HTMLParser):
                         end_time = found.group(2)
                         if end_time not in end_times:
                             end_times.append(end_time)
-                if dayuse_end_time is not None:
-                    if end_time != dayuse_end_time:
+                if dayuse_range is not None:
+                    _, end_range, _ = parse_dayuse_end_filter(end_time)
+                    if end_range is None:
+                        continue
+                    end_minute = end_range[0]
+                    if end_minute < dayuse_range[0] or end_minute > dayuse_range[1]:
                         continue
                     time_match = True
                 matched_scopes += 1
