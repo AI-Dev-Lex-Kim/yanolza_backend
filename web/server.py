@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import ssl
 import sys
 import threading
@@ -34,7 +33,7 @@ def _get_runtime_root() -> Path:
 RUNTIME_ROOT = _get_runtime_root()
 sys.path.insert(0, str(RUNTIME_ROOT))
 
-from app import RoomAvailabilityDetector
+from app import RoomAvailabilityDetector, parse_dayuse_end_filter
 
 
 WEB_DIR = RUNTIME_ROOT / "web"
@@ -50,7 +49,6 @@ MONITOR_KEEP_LIMIT = 180
 DEFAULT_LOG_LIMIT = 180
 MAX_LOG_LIMIT = 180
 MONITOR_IDLE_WAIT_SECONDS = 1.0
-CLOCK_RE = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
 MONITOR_START_FIELDS = {
     "user_id",
     "name",
@@ -405,8 +403,9 @@ def parse_monitor_start(payload: dict[str, Any], ntfy_topic: str | None) -> tupl
     dayuse_end_time, error = normalize_monitor_text(payload.get("dayuse_end_time"), "dayuse_end_time")
     if error:
         return None, error
-    if dayuse_end_time and CLOCK_RE.fullmatch(dayuse_end_time) is None:
-        return None, "Invalid dayuse_end_time"
+    dayuse_end_time, _, error = parse_dayuse_end_filter(dayuse_end_time)
+    if error:
+        return None, error
     if dayuse_end_time and stay_type != "대실":
         return None, "dayuse_end_time requires stay_type=대실"
 
@@ -1405,7 +1404,8 @@ class Handler(SimpleHTTPRequestHandler):
             elif dayuse_end_time is not None:
                 self._send_json({"ok": False, "error": "Invalid dayuse_end_time"}, status=400)
                 return
-            if dayuse_end_time and CLOCK_RE.fullmatch(dayuse_end_time) is None:
+            dayuse_end_time, _, error = parse_dayuse_end_filter(dayuse_end_time)
+            if error:
                 self._send_json({"ok": False, "error": "Invalid dayuse_end_time"}, status=400)
                 return
             if dayuse_end_time and stay_type != "대실":
