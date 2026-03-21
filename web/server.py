@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import ssl
 import sys
 import threading
@@ -49,6 +50,7 @@ MONITOR_KEEP_LIMIT = 180
 DEFAULT_LOG_LIMIT = 180
 MAX_LOG_LIMIT = 180
 MONITOR_IDLE_WAIT_SECONDS = 1.0
+CLOCK_RE = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
 MONITOR_START_FIELDS = {
     "user_id",
     "name",
@@ -58,6 +60,7 @@ MONITOR_START_FIELDS = {
     "stay_type",
     "check_in",
     "check_out",
+    "dayuse_end_time",
     "interval_seconds",
     "start_notify",
     "ntfy_enabled",
@@ -253,6 +256,7 @@ class MonitorSpec:
     stay_type: str | None
     check_in: str | None
     check_out: str | None
+    dayuse_end_time: str | None
     interval_seconds: int
     start_notify: bool
     target_key: str
@@ -293,6 +297,7 @@ class MonitorRecord:
             "stay_type": self.spec.stay_type,
             "check_in": self.spec.check_in,
             "check_out": self.spec.check_out,
+            "dayuse_end_time": self.spec.dayuse_end_time,
             "interval_seconds": self.spec.interval_seconds,
             "start_notify": self.spec.start_notify,
             "last_checked_at": self.state.last_checked_at,
@@ -331,6 +336,7 @@ def build_monitor_key(
     stay_type: str | None,
     check_in: str | None,
     check_out: str | None,
+    dayuse_end_time: str | None,
 ) -> str:
     return json.dumps(
         {
@@ -341,6 +347,7 @@ def build_monitor_key(
             "stay_type": stay_type,
             "check_in": check_in,
             "check_out": check_out,
+            "dayuse_end_time": dayuse_end_time,
         },
         ensure_ascii=False,
         sort_keys=True,
@@ -395,6 +402,13 @@ def parse_monitor_start(payload: dict[str, Any], ntfy_topic: str | None) -> tupl
     check_out, error = normalize_monitor_text(payload.get("check_out"), "check_out")
     if error:
         return None, error
+    dayuse_end_time, error = normalize_monitor_text(payload.get("dayuse_end_time"), "dayuse_end_time")
+    if error:
+        return None, error
+    if dayuse_end_time and CLOCK_RE.fullmatch(dayuse_end_time) is None:
+        return None, "Invalid dayuse_end_time"
+    if dayuse_end_time and stay_type != "대실":
+        return None, "dayuse_end_time requires stay_type=대실"
 
     scan_all = payload.get("scan_all")
     if not isinstance(scan_all, bool):
@@ -421,7 +435,16 @@ def parse_monitor_start(payload: dict[str, Any], ntfy_topic: str | None) -> tupl
     if not scan_all and not room_name:
         return None, "Missing room_name"
 
-    target_key = build_monitor_key(user_id, url, room_name, scan_all, stay_type, check_in, check_out)
+    target_key = build_monitor_key(
+        user_id,
+        url,
+        room_name,
+        scan_all,
+        stay_type,
+        check_in,
+        check_out,
+        dayuse_end_time,
+    )
     return (
         MonitorSpec(
             user_id=user_id,
@@ -432,6 +455,7 @@ def parse_monitor_start(payload: dict[str, Any], ntfy_topic: str | None) -> tupl
             stay_type=stay_type,
             check_in=check_in,
             check_out=check_out,
+            dayuse_end_time=dayuse_end_time,
             interval_seconds=interval_seconds,
             start_notify=start_notify,
             target_key=target_key,
@@ -496,8 +520,13 @@ def build_monitor_message(
     error_text: str | None,
     reason: str,
 ) -> str:
+    labels: list[str] = []
     stay_label = str(spec.stay_type or "").strip()
-    prefix = f"[{stay_label}] " if stay_label else ""
+    if stay_label:
+        labels.append(stay_label)
+    if spec.dayuse_end_time:
+        labels.append(spec.dayuse_end_time)
+    prefix = f"[{' '.join(labels)}] " if labels else ""
     if reason == "start":
         if spec.scan_all:
             rooms_text = ", ".join(available_rooms) if available_rooms else "없음"
@@ -718,6 +747,7 @@ class MonitorManager:
                 job.spec.stay_type,
                 job.spec.check_in,
                 job.spec.check_out,
+                job.spec.dayuse_end_time,
                 job.spec.scan_all,
             )
             status = str(result.get("status") or "unknown")
@@ -782,6 +812,7 @@ class MonitorManager:
             "stay_type": job.spec.stay_type,
             "check_in": job.spec.check_in,
             "check_out": job.spec.check_out,
+            "dayuse_end_time": job.spec.dayuse_end_time,
             "user_id": job.spec.user_id,
             "error": error_text,
             "monitor_id": job.monitor_id,
@@ -1113,25 +1144,61 @@ def check_room(
     stay_type: str | None,
     check_in: str | None,
     check_out: str | None,
+    dayuse_end_time: str | None,
     scan_all: bool,
 ) -> dict[str, Any]:
     url_with_dates = build_url_with_dates(url, check_in, check_out)
     html = fetch_html(url_with_dates)
     detector = RoomAvailabilityDetector(room_name)
     detector.feed(html)
-    available, details = detector.evaluate(stay_type=stay_type, scan_all=scan_all)
+    available, details = detector.evaluate(
+        stay_type=stay_type,
+        scan_all=scan_all,
+        dayuse_end_time=dayuse_end_time,
+    )
     display_details = details
     if stay_type:
-        display_details = [d for d in details if d.get("stay_type_match")]
+        filtered = []
+        for detail in details:
+            if detail.get("stay_type_match"):
+                filtered.append(detail)
+        display_details = filtered
+    if dayuse_end_time:
+        filtered = []
+        for detail in display_details:
+            if detail.get("dayuse_end_time_match"):
+                filtered.append(detail)
+        display_details = filtered
     room_found = bool(details)
     stay_type_found = None
     if stay_type:
-        stay_type_found = any(d.get("stay_type_match") for d in details)
-    any_closed = any(d.get("stay_type_match") and d.get("has_closed") for d in details)
+        stay_type_found = False
+        for detail in details:
+            if detail.get("stay_type_match"):
+                stay_type_found = True
+                break
+    dayuse_end_time_found = None
+    if dayuse_end_time:
+        dayuse_end_time_found = False
+        for detail in details:
+            if detail.get("dayuse_end_time_match"):
+                dayuse_end_time_found = True
+                break
+    any_closed = False
+    for detail in details:
+        if stay_type and not detail.get("stay_type_match"):
+            continue
+        if dayuse_end_time and not detail.get("dayuse_end_time_match"):
+            continue
+        if detail.get("has_closed"):
+            any_closed = True
+            break
     if not room_found:
         status = "room_not_found"
     elif stay_type and not stay_type_found:
         status = "stay_type_not_found"
+    elif dayuse_end_time and not dayuse_end_time_found:
+        status = "dayuse_end_time_not_found"
     else:
         status = "available" if available else "closed" if any_closed else "unknown"
     return {
@@ -1141,6 +1208,7 @@ def check_room(
         "url": url_with_dates,
         "room_found": room_found,
         "stay_type_found": stay_type_found,
+        "dayuse_end_time_found": dayuse_end_time_found,
         "checked_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -1331,6 +1399,18 @@ class Handler(SimpleHTTPRequestHandler):
             check_out = payload.get("check_out")
             check_out = check_out.strip() if isinstance(check_out, str) else None
             check_out = check_out or None
+            dayuse_end_time = payload.get("dayuse_end_time")
+            if isinstance(dayuse_end_time, str):
+                dayuse_end_time = dayuse_end_time.strip() or None
+            elif dayuse_end_time is not None:
+                self._send_json({"ok": False, "error": "Invalid dayuse_end_time"}, status=400)
+                return
+            if dayuse_end_time and CLOCK_RE.fullmatch(dayuse_end_time) is None:
+                self._send_json({"ok": False, "error": "Invalid dayuse_end_time"}, status=400)
+                return
+            if dayuse_end_time and stay_type != "대실":
+                self._send_json({"ok": False, "error": "dayuse_end_time requires stay_type=대실"}, status=400)
+                return
             monitor_logs = self._get_monitor_logs()
             started_at = time.perf_counter()
 
@@ -1360,6 +1440,7 @@ class Handler(SimpleHTTPRequestHandler):
                         "stay_type": stay_type,
                         "check_in": check_in,
                         "check_out": check_out,
+                        "dayuse_end_time": dayuse_end_time,
                         "error": error_text,
                     }
                 )
@@ -1369,7 +1450,15 @@ class Handler(SimpleHTTPRequestHandler):
                 self._send_json({"ok": False, "error": "Missing url or room_name"}, status=400)
                 return
             try:
-                result = check_room(url, room_name, stay_type, check_in, check_out, scan_all)
+                result = check_room(
+                    url,
+                    room_name,
+                    stay_type,
+                    check_in,
+                    check_out,
+                    dayuse_end_time,
+                    scan_all,
+                )
             except Exception as err:
                 _record_log(ok=False, status="error", error_text=str(err))
                 self._send_json({"ok": False, "error": str(err)}, status=500)
