@@ -192,6 +192,23 @@ def force_due(manager: server.MonitorManager, monitor_id: str) -> None:
 
 
 class CheckRoomTests(unittest.TestCase):
+    def test_check_room_allows_dayuse_end_time_range(self) -> None:
+        with mock.patch.object(server, "fetch_html", return_value=DAYUSE_HTML):
+            result = server.check_room(
+                "https://example.com/room",
+                "Deluxe",
+                "대실",
+                None,
+                None,
+                "오후 9~10",
+                False,
+            )
+
+        self.assertTrue(result["available"])
+        self.assertEqual("available", result["status"])
+        self.assertTrue(result["dayuse_end_time_found"])
+        self.assertEqual(2, len(result["matches"]))
+
     def test_check_room_filters_dayuse_end_time(self) -> None:
         with mock.patch.object(server, "fetch_html", return_value=DAYUSE_HTML):
             result = server.check_room(
@@ -227,6 +244,11 @@ class CheckRoomTests(unittest.TestCase):
         self.assertEqual("dayuse_end_time_not_found", result["status"])
         self.assertFalse(result["dayuse_end_time_found"])
         self.assertEqual([], result["matches"])
+
+    def test_parse_monitor_start_treats_any_dayuse_end_time_as_none(self) -> None:
+        spec = make_spec(stay_type="대실", dayuse_end_time="상관없음")
+
+        self.assertIsNone(spec.dayuse_end_time)
 
 
 class MonitorManagerTests(unittest.TestCase):
@@ -639,6 +661,16 @@ class ApiTests(unittest.TestCase):
         self.assertIsNotNone(body["monitor_id"])
         self.assertEqual("user-a", body["monitor"]["user_id"])
 
+    def test_start_monitor_accepts_dayuse_end_time_range(self) -> None:
+        status, body = self.post_json(
+            "/monitors/start",
+            make_payload(stay_type="대실", dayuse_end_time="오후 9~10"),
+        )
+
+        self.assertEqual(200, status)
+        self.assertTrue(body["ok"])
+        self.assertEqual("오후 9~10", body["monitor"]["dayuse_end_time"])
+
     def test_start_monitor_rejects_ntfy_disabled(self) -> None:
         status, body = self.post_json("/monitors/start", make_payload(ntfy_enabled=False))
 
@@ -653,6 +685,7 @@ class ApiTests(unittest.TestCase):
             make_payload(interval_seconds=0),
             make_payload(room_name=None, scan_all=False),
             make_payload(stay_type="대실", dayuse_end_time="bad"),
+            make_payload(stay_type="대실", dayuse_end_time="오후 15~16"),
             make_payload(dayuse_end_time="22:00"),
         ]
 
