@@ -251,6 +251,29 @@ class CheckRoomTests(unittest.TestCase):
         self.assertIsNone(spec.dayuse_end_time)
 
 
+class NtfyTopicTests(unittest.TestCase):
+    def tearDown(self) -> None:
+        server.NTFY_TOPIC_CACHE = None
+
+    def test_get_ntfy_topic_normalizes_env_value(self) -> None:
+        with mock.patch.dict(os.environ, {"NTFY_TOPIC": "https://ntfy.sh/topic-a"}):
+            self.assertEqual("topic-a", server.get_ntfy_topic())
+
+    def test_get_ntfy_topic_reads_secret_manager_when_env_missing(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "NTFY_TOPIC": "",
+                "GCP_PROJECT_ID": "project-a",
+                "NTFY_TOPIC_SECRET": "secret-a",
+            },
+        ):
+            with mock.patch.object(server, "read_secret_value", return_value="ntfy.sh/topic-b") as read_secret:
+                self.assertEqual("topic-b", server.get_ntfy_topic())
+
+        read_secret.assert_called_once_with("project-a", "secret-a")
+
+
 class MonitorManagerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmpdir = tempfile.TemporaryDirectory()
