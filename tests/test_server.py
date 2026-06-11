@@ -728,6 +728,24 @@ class ApiTests(unittest.TestCase):
             )
             self.assertIn("POST", response.headers.get("Access-Control-Allow-Methods", ""))
 
+    def test_options_allows_local_netlify_dev_origin(self) -> None:
+        request = urllib.request.Request(
+            f"{self.base_url}/check",
+            headers={
+                "Origin": "http://localhost:8888",
+                "Access-Control-Request-Method": "POST",
+            },
+            method="OPTIONS",
+        )
+
+        with urllib.request.urlopen(request, timeout=3.0) as response:
+            self.assertEqual(204, response.status)
+            self.assertEqual(
+                "http://localhost:8888",
+                response.headers.get("Access-Control-Allow-Origin"),
+            )
+            self.assertIn("POST", response.headers.get("Access-Control-Allow-Methods", ""))
+
     def test_check_rejects_unlisted_url_when_enabled(self) -> None:
         with mock.patch.dict(os.environ, {"URL_ALLOWLIST_ENABLED": "1"}):
             status, body = self.post_json(
