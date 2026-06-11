@@ -52,7 +52,11 @@ MONITOR_IDLE_WAIT_SECONDS = 1.0
 CHECK_CONDITION = threading.Condition()
 CHECK_NEXT = 0
 CHECK_SERVING = 0
-DEFAULT_FRONTEND_ORIGIN = "https://yanolza-frontend.netlify.app"
+DEFAULT_FRONTEND_ORIGINS = (
+    "https://yanolza-frontend.netlify.app",
+    "http://localhost:8888",
+    "http://127.0.0.1:8888",
+)
 MONITOR_START_FIELDS = {
     "user_id",
     "name",
@@ -1278,16 +1282,29 @@ def dispatch_disconnect_events(events: list[SessionEvent]) -> None:
         print(f"Disconnect alert send failed: {result.get('error')}", flush=True)
 
 
+def get_frontend_origins() -> set[str]:
+    origins: set[str] = set(DEFAULT_FRONTEND_ORIGINS)
+    raw_values = [
+        os.environ.get("FRONTEND_ORIGINS", ""),
+        os.environ.get("FRONTEND_ORIGIN", ""),
+    ]
+    for raw_value in raw_values:
+        for origin in raw_value.split(","):
+            origin = origin.strip().rstrip("/")
+            if origin:
+                origins.add(origin)
+    return origins
+
+
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, directory=str(WEB_DIR), **kwargs)
 
     def _send_cors(self) -> None:
-        allowed = os.environ.get("FRONTEND_ORIGIN", "").strip() or DEFAULT_FRONTEND_ORIGIN
         origin = (self.headers.get("Origin") or "").strip()
-        if origin != allowed:
+        if origin not in get_frontend_origins():
             return
-        self.send_header("Access-Control-Allow-Origin", allowed)
+        self.send_header("Access-Control-Allow-Origin", origin)
         self.send_header("Vary", "Origin")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, X-YRA-Action")
