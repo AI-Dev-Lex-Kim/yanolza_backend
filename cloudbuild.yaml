@@ -9,7 +9,7 @@ steps:
           --zone=us-west1-a \
           --tunnel-through-iap \
           --strict-host-key-checking=no \
-          --command='sudo -u deploy -H bash -lc "cd /opt/yanolja_backend && git pull --ff-only origin main && docker compose up -d --build && docker image prune -f && docker compose ps"'
+          --command='sudo -u deploy -H bash -lc "if [ ! -d /opt/yanolja_backend/.git ]; then find /opt/yanolja_backend -mindepth 1 -maxdepth 1 -exec rm -rf {} + && git clone git@github.com:AI-Dev-Lex-Kim/yanolja_backend.git /opt/yanolja_backend; fi && cd /opt/yanolja_backend && git pull --ff-only origin main && docker compose up -d --build && docker image prune -f && docker compose ps"'
 
 options:
   logging: CLOUD_LOGGING_ONLY
