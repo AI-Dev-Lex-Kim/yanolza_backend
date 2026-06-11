@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import ssl
@@ -39,6 +40,12 @@ from app import RoomAvailabilityDetector, parse_dayuse_end_filter
 WEB_DIR = RUNTIME_ROOT / "web"
 PROJECT_ENV_PATH = RUNTIME_ROOT / ".env"
 NTFY_BASE_URL = "https://ntfy.sh"
+GCP_METADATA_HEADERS = {"Metadata-Flavor": "Google"}
+GCP_METADATA_PROJECT_URL = "http://metadata.google.internal/computeMetadata/v1/project/project-id"
+GCP_METADATA_TOKEN_URL = (
+    "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token"
+)
+NTFY_TOPIC_SECRET = "yanolja-ntfy-topic"
 SERVICE_NAME = "yanolja-refund-alert"
 APP_DATA_DIR_NAME = "YanoljaRefundAlert"
 SESSION_TIMEOUT_SECONDS = 45.0
@@ -57,6 +64,7 @@ DEFAULT_FRONTEND_ORIGINS = (
     "http://localhost:8888",
     "http://127.0.0.1:8888",
 )
+NTFY_TOPIC_CACHE: str | None = None
 MONITOR_START_FIELDS = {
     "user_id",
     "name",
@@ -577,7 +585,7 @@ class MonitorManager:
         self._check_fn = check_fn
         self._notify_fn = notify_fn
         if topic_getter is None:
-            topic_getter = lambda: os.environ.get("NTFY_TOPIC", "").strip()
+            topic_getter = get_ntfy_topic
         self._topic_getter = topic_getter
         self._lock = threading.Lock()
         self._records: dict[str, MonitorRecord] = {}
@@ -1232,6 +1240,71 @@ def check_room(
     }
 
 
+def normalize_ntfy_topic(value: str) -> str:
+    topic = value.strip()
+    if topic.startswith("https://ntfy.sh/"):
+        topic = topic.removeprefix("https://ntfy.sh/")
+    elif topic.startswith("ntfy.sh/"):
+        topic = topic.removeprefix("ntfy.sh/")
+    return topic.strip("/")
+
+
+def read_metadata_text(url: str) -> str:
+    req = urllib.request.Request(url, headers=GCP_METADATA_HEADERS)
+    with urllib.request.urlopen(req, timeout=3) as response:
+        return response.read().decode("utf-8").strip()
+
+
+def read_secret_value(project_id: str, secret_name: str) -> str:
+    token_text = read_metadata_text(GCP_METADATA_TOKEN_URL)
+    token = json.loads(token_text).get("access_token", "")
+    if not token:
+        return ""
+    if secret_name.startswith("projects/"):
+        version_name = secret_name
+        if "/versions/" not in version_name:
+            version_name = f"{version_name}/versions/latest"
+    else:
+        version_name = f"projects/{project_id}/secrets/{secret_name}/versions/latest"
+    encoded_name = urllib.parse.quote(version_name, safe="/")
+    req = urllib.request.Request(
+        f"https://secretmanager.googleapis.com/v1/{encoded_name}:access",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    with urllib.request.urlopen(req, timeout=5) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    data = payload.get("payload", {}).get("data", "")
+    if not data:
+        return ""
+    return base64.b64decode(data).decode("utf-8").strip()
+
+
+def get_ntfy_topic() -> str:
+    global NTFY_TOPIC_CACHE
+    env_topic = normalize_ntfy_topic(os.environ.get("NTFY_TOPIC", ""))
+    if env_topic:
+        return env_topic
+    if NTFY_TOPIC_CACHE is not None:
+        return NTFY_TOPIC_CACHE
+    secret_name = os.environ.get("NTFY_TOPIC_SECRET", NTFY_TOPIC_SECRET).strip()
+    project_id = os.environ.get("GCP_PROJECT_ID", "").strip()
+    if not project_id:
+        project_id = os.environ.get("GOOGLE_CLOUD_PROJECT", "").strip()
+    if not project_id:
+        try:
+            project_id = read_metadata_text(GCP_METADATA_PROJECT_URL)
+        except Exception as err:
+            print(f"Unable to resolve GCP project id: {err}", flush=True)
+            NTFY_TOPIC_CACHE = ""
+            return ""
+    try:
+        NTFY_TOPIC_CACHE = normalize_ntfy_topic(read_secret_value(project_id, secret_name))
+    except Exception as err:
+        print(f"Unable to read NTFY_TOPIC from Secret Manager: {err}", flush=True)
+        NTFY_TOPIC_CACHE = ""
+    return NTFY_TOPIC_CACHE
+
+
 def send_ntfy_message(topic: str, text: str) -> dict[str, Any]:
     safe_text = (text or "").strip()
     if not topic:
@@ -1270,7 +1343,7 @@ def build_disconnect_alert_message(event: SessionEvent) -> str:
 def dispatch_disconnect_events(events: list[SessionEvent]) -> None:
     if not events:
         return
-    topic = os.environ.get("NTFY_TOPIC", "").strip()
+    topic = get_ntfy_topic()
     if not topic:
         print("Disconnect alert skipped: NTFY_TOPIC missing", flush=True)
         return
@@ -1411,7 +1484,7 @@ class Handler(SimpleHTTPRequestHandler):
             if not isinstance(url, str) or not allow_url(url):
                 self._send_json({"ok": False, "error": "URL not allowed"}, status=400)
                 return
-            topic = os.environ.get("NTFY_TOPIC", "").strip()
+            topic = get_ntfy_topic()
             spec, error = parse_monitor_start(payload, topic)
             if error:
                 self._send_json({"ok": False, "error": error}, status=400)
@@ -1549,7 +1622,7 @@ class Handler(SimpleHTTPRequestHandler):
             if not message:
                 self.send_error(400, "Missing message")
                 return
-            topic = os.environ.get("NTFY_TOPIC", "").strip()
+            topic = get_ntfy_topic()
             if not topic:
                 self.send_error(400, "Missing NTFY_TOPIC")
                 return
