@@ -8,7 +8,12 @@ python3 web/server.py --host 0.0.0.0 --port 8787
 
 ## Environment Variables
 
-- `NTFY_TOPIC`: ntfy topic for `/notify`.
+- `NTFY_TOPIC`: local development fallback topic for `/notify`.
+- `NTFY_TOPIC_SECRET`: Secret Manager secret name for the production ntfy topic. Defaults to `yanolja-ntfy-topic`.
+- `GCP_PROJECT_ID`: Google Cloud project used for Secret Manager. Defaults to `yanolja-alert` in Docker Compose.
+
+Production reads the ntfy topic from Google Secret Manager with the VM service account.
+The VM service account needs `roles/secretmanager.secretAccessor` and a Secret Manager-compatible access scope such as `cloud-platform`.
 
 `/monitors/start`로 백그라운드 감시를 등록하면, 첫 감지부터 예약 가능 상태를 찾는 즉시 `NTFY_TOPIC`으로 알림을 보냅니다.
 
