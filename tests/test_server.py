@@ -710,6 +710,113 @@ class ApiTests(unittest.TestCase):
         self.assertFalse(body["ok"])
         self.assertIn("dayuse_end_time", body["error"])
 
+    def test_options_allows_frontend_origin(self) -> None:
+        request = urllib.request.Request(
+            f"{self.base_url}/check",
+            headers={
+                "Origin": "https://yanolza-frontend.netlify.app",
+                "Access-Control-Request-Method": "POST",
+            },
+            method="OPTIONS",
+        )
+
+        with urllib.request.urlopen(request, timeout=3.0) as response:
+            self.assertEqual(204, response.status)
+            self.assertEqual(
+                "https://yanolza-frontend.netlify.app",
+                response.headers.get("Access-Control-Allow-Origin"),
+            )
+            self.assertIn("POST", response.headers.get("Access-Control-Allow-Methods", ""))
+
+    def test_check_rejects_unlisted_url_when_enabled(self) -> None:
+        with mock.patch.dict(os.environ, {"URL_ALLOWLIST_ENABLED": "1"}):
+            status, body = self.post_json(
+                "/check",
+                {
+                    "url": "https://example.com/room",
+                    "room_name": "Deluxe",
+                    "scan_all": False,
+                    "stay_type": "숙박",
+                },
+            )
+
+        self.assertEqual(400, status)
+        self.assertFalse(body["ok"])
+        self.assertEqual("URL not allowed", body["error"])
+
+    def test_start_monitor_rejects_unlisted_url_when_enabled(self) -> None:
+        with mock.patch.dict(os.environ, {"URL_ALLOWLIST_ENABLED": "1"}):
+            status, body = self.post_json("/monitors/start", make_payload())
+
+        self.assertEqual(400, status)
+        self.assertFalse(body["ok"])
+        self.assertEqual("URL not allowed", body["error"])
+
+    def test_check_requests_run_one_at_a_time(self) -> None:
+        previous_check = server.check_room
+        first_started = threading.Event()
+        release_first = threading.Event()
+        calls: list[str] = []
+        calls_lock = threading.Lock()
+
+        def fake_check(
+            url: str,
+            room_name: str | None,
+            stay_type: str | None,
+            check_in: str | None,
+            check_out: str | None,
+            dayuse_end_time: str | None,
+            scan_all: bool,
+        ) -> dict[str, object]:
+            item = url.rsplit("/", 1)[-1]
+            with calls_lock:
+                calls.append(f"start-{item}")
+            if item == "first":
+                first_started.set()
+                self.assertTrue(release_first.wait(timeout=2.0))
+            with calls_lock:
+                calls.append(f"end-{item}")
+            return {
+                "available": True,
+                "status": "available",
+                "matches": [],
+                "url": url,
+            }
+
+        def run_check(name: str, results: dict[str, tuple[int, dict[str, object]]]) -> None:
+            results[name] = self.post_json(
+                "/check",
+                {
+                    "url": f"https://example.com/{name}",
+                    "room_name": "Deluxe",
+                    "scan_all": False,
+                    "stay_type": "숙박",
+                },
+            )
+
+        results: dict[str, tuple[int, dict[str, object]]] = {}
+        try:
+            server.check_room = fake_check
+            first = threading.Thread(target=run_check, args=("first", results))
+            second = threading.Thread(target=run_check, args=("second", results))
+
+            first.start()
+            self.assertTrue(first_started.wait(timeout=2.0))
+            second.start()
+            time.sleep(0.1)
+            with calls_lock:
+                self.assertEqual(["start-first"], calls)
+            release_first.set()
+            first.join(timeout=2.0)
+            second.join(timeout=2.0)
+        finally:
+            server.check_room = previous_check
+
+        with calls_lock:
+            self.assertEqual(["start-first", "end-first", "start-second", "end-second"], calls)
+        self.assertEqual(200, results["first"][0])
+        self.assertEqual(200, results["second"][0])
+
     def test_monitors_list_and_stop(self) -> None:
         _, start_body = self.post_json("/monitors/start", make_payload())
         self.post_json("/monitors/start", make_payload(user_id="user-b", url="https://example.com/other"))
