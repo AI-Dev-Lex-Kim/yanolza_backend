@@ -49,6 +49,10 @@ MONITOR_KEEP_LIMIT = 180
 DEFAULT_LOG_LIMIT = 180
 MAX_LOG_LIMIT = 180
 MONITOR_IDLE_WAIT_SECONDS = 1.0
+CHECK_CONDITION = threading.Condition()
+CHECK_NEXT = 0
+CHECK_SERVING = 0
+DEFAULT_FRONTEND_ORIGIN = "https://yanolza-frontend.netlify.app"
 MONITOR_START_FIELDS = {
     "user_id",
     "name",
@@ -71,6 +75,14 @@ def normalize_client_type(value: str | None) -> str:
     if normalized in {"web", "cli"}:
         return normalized
     return "web"
+
+
+def allow_url(value: str) -> bool:
+    if os.environ.get("URL_ALLOWLIST_ENABLED", "").strip() != "1":
+        return True
+    parsed = urllib.parse.urlparse(value)
+    host = (parsed.hostname or "").lower()
+    return parsed.scheme == "https" and host in {"nol.yanolja.com", "place-site.yanolja.com"}
 
 
 @dataclass
@@ -1266,10 +1278,21 @@ class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, directory=str(WEB_DIR), **kwargs)
 
+    def _send_cors(self) -> None:
+        allowed = os.environ.get("FRONTEND_ORIGIN", "").strip() or DEFAULT_FRONTEND_ORIGIN
+        origin = (self.headers.get("Origin") or "").strip()
+        if origin != allowed:
+            return
+        self.send_header("Access-Control-Allow-Origin", allowed)
+        self.send_header("Vary", "Origin")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-YRA-Action")
+
     def _send_json(self, payload: dict[str, Any], status: int = 200) -> None:
         body = json.dumps(payload).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        self._send_cors()
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -1295,6 +1318,12 @@ class Handler(SimpleHTTPRequestHandler):
 
     def _is_shutdown_allowed(self) -> bool:
         return bool(getattr(self.server, "allow_shutdown_api", False))
+
+    def do_OPTIONS(self) -> None:
+        self.send_response(204)
+        self._send_cors()
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def do_POST(self) -> None:
         if self.path == "/server/shutdown":
@@ -1356,6 +1385,10 @@ class Handler(SimpleHTTPRequestHandler):
             monitor_manager = self._get_monitor_manager()
             if monitor_manager is None:
                 self._send_json({"ok": False, "error": "Monitor manager unavailable"}, status=503)
+                return
+            url = payload.get("url")
+            if not isinstance(url, str) or not allow_url(url):
+                self._send_json({"ok": False, "error": "URL not allowed"}, status=400)
                 return
             topic = os.environ.get("NTFY_TOPIC", "").strip()
             spec, error = parse_monitor_start(payload, topic)
@@ -1449,29 +1482,44 @@ class Handler(SimpleHTTPRequestHandler):
                 _record_log(ok=False, status="bad_request", error_text="Missing url or room_name")
                 self._send_json({"ok": False, "error": "Missing url or room_name"}, status=400)
                 return
-            try:
-                result = check_room(
-                    url,
-                    room_name,
-                    stay_type,
-                    check_in,
-                    check_out,
-                    dayuse_end_time,
-                    scan_all,
-                )
-            except Exception as err:
-                _record_log(ok=False, status="error", error_text=str(err))
-                self._send_json({"ok": False, "error": str(err)}, status=500)
+            if not allow_url(url):
+                _record_log(ok=False, status="bad_request", error_text="URL not allowed")
+                self._send_json({"ok": False, "error": "URL not allowed"}, status=400)
                 return
-            _record_log(
-                ok=True,
-                status=str(result.get("status") or "unknown"),
-                available=bool(result.get("available")),
-                match_count=len(result.get("matches", [])) if isinstance(result.get("matches"), list) else None,
-                checked_url=str(result.get("url") or url),
-            )
-            self._send_json(result)
-            return
+            global CHECK_NEXT, CHECK_SERVING
+            with CHECK_CONDITION:
+                ticket = CHECK_NEXT
+                CHECK_NEXT += 1
+                while ticket != CHECK_SERVING:
+                    CHECK_CONDITION.wait()
+            try:
+                try:
+                    result = check_room(
+                        url,
+                        room_name,
+                        stay_type,
+                        check_in,
+                        check_out,
+                        dayuse_end_time,
+                        scan_all,
+                    )
+                except Exception as err:
+                    _record_log(ok=False, status="error", error_text=str(err))
+                    self._send_json({"ok": False, "error": str(err)}, status=500)
+                    return
+                _record_log(
+                    ok=True,
+                    status=str(result.get("status") or "unknown"),
+                    available=bool(result.get("available")),
+                    match_count=len(result.get("matches", [])) if isinstance(result.get("matches"), list) else None,
+                    checked_url=str(result.get("url") or url),
+                )
+                self._send_json(result)
+                return
+            finally:
+                with CHECK_CONDITION:
+                    CHECK_SERVING += 1
+                    CHECK_CONDITION.notify_all()
 
         if self.path == "/notify":
             message = (payload.get("message") or "").strip()
