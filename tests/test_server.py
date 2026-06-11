@@ -472,7 +472,7 @@ class MonitorLogStoreTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.tmpdir.cleanup()
 
-    def test_log_store_keeps_up_to_180_entries(self) -> None:
+    def test_log_store_keeps_up_to_60_entries(self) -> None:
         for idx in range(server.MONITOR_KEEP_LIMIT + 5):
             self.logs.append_check(
                 {
@@ -485,8 +485,8 @@ class MonitorLogStoreTests(unittest.TestCase):
 
         events = self.logs.recent(limit=server.MAX_LOG_LIMIT)
 
-        self.assertEqual(180, len(events))
-        self.assertEqual("https://example.com/184", events[0]["url"])
+        self.assertEqual(60, len(events))
+        self.assertEqual("https://example.com/64", events[0]["url"])
         self.assertEqual("https://example.com/5", events[-1]["url"])
 
 
