@@ -6,7 +6,7 @@ steps:
       - |
         printf '%s' "$$VM_SSH_KEY" > /workspace/vm_ssh_key
         chmod 600 /workspace/vm_ssh_key
-        gcloud compute ssh yanolja-backend \
+        gcloud compute ssh deploy@yanolja-backend \
           --project=yanolja-alert \
           --zone=us-west1-a \
           --tunnel-through-iap \
