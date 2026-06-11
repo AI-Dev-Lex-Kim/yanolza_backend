@@ -4,7 +4,8 @@ services:
     restart: unless-stopped
     environment:
       FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-https://yanolza-frontend.netlify.app}
-      NTFY_TOPIC: ${NTFY_TOPIC:-}
+      GCP_PROJECT_ID: ${GCP_PROJECT_ID:-yanolja-alert}
+      NTFY_TOPIC_SECRET: ${NTFY_TOPIC_SECRET:-yanolja-ntfy-topic}
       URL_ALLOWLIST_ENABLED: ${URL_ALLOWLIST_ENABLED:-1}
     volumes:
       - backend-data:/app/data
@@ -15,7 +16,7 @@ services:
     depends_on:
       - backend
     environment:
-      BACKEND_HOST: ${BACKEND_HOST:-:80}
+      BACKEND_HOST: ${BACKEND_HOST:-35.212.226.217.sslip.io}
     ports:
       - "80:80"
       - "443:443"
