@@ -1,0 +1,30 @@
+services:
+  backend:
+    build: .
+    restart: unless-stopped
+    environment:
+      FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-https://yanolza-frontend.netlify.app}
+      NTFY_TOPIC: ${NTFY_TOPIC:-}
+      URL_ALLOWLIST_ENABLED: ${URL_ALLOWLIST_ENABLED:-1}
+    volumes:
+      - backend-data:/app/data
+
+  caddy:
+    image: caddy:2.8-alpine
+    restart: unless-stopped
+    depends_on:
+      - backend
+    environment:
+      BACKEND_HOST: ${BACKEND_HOST:-:80}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  backend-data:
+  caddy-data:
+  caddy-config:
