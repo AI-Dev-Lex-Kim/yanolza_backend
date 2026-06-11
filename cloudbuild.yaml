@@ -4,12 +4,25 @@ steps:
     args:
       - -ceu
       - |
+        printf '%s' "$$VM_SSH_KEY" > /workspace/vm_ssh_key
+        chmod 600 /workspace/vm_ssh_key
         gcloud compute ssh yanolja-backend \
           --project=yanolja-alert \
           --zone=us-west1-a \
           --tunnel-through-iap \
-          --strict-host-key-checking=no \
-          --command='sudo -u deploy -H bash -lc "if [ ! -d /opt/yanolja_backend/.git ]; then find /opt/yanolja_backend -mindepth 1 -maxdepth 1 -exec rm -rf {} + && git clone git@github.com:AI-Dev-Lex-Kim/yanolza_backend.git /opt/yanolja_backend; fi && cd /opt/yanolja_backend && git pull --ff-only origin main && docker compose up -d --build && docker image prune -f && docker compose ps"'
+          --plain \
+          --ssh-flag="-i /workspace/vm_ssh_key" \
+          --ssh-flag="-o IdentitiesOnly=yes" \
+          --ssh-flag="-o StrictHostKeyChecking=no" \
+          --ssh-flag="-o UserKnownHostsFile=/dev/null" \
+          --command='if [ ! -d /opt/yanolja_backend/.git ]; then find /opt/yanolja_backend -mindepth 1 -maxdepth 1 -exec rm -rf {} + && git clone git@github.com:AI-Dev-Lex-Kim/yanolza_backend.git /opt/yanolja_backend; fi && cd /opt/yanolja_backend && git pull --ff-only origin main && docker compose up -d --build && docker image prune -f && docker compose ps'
+    secretEnv:
+      - VM_SSH_KEY
 
 options:
   logging: CLOUD_LOGGING_ONLY
+
+availableSecrets:
+  secretManager:
+    - versionName: projects/yanolja-alert/secrets/yanolja-cloudbuild-vm-ssh-key/versions/latest
+      env: VM_SSH_KEY
